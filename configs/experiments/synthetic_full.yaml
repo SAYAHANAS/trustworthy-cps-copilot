@@ -1,0 +1,20 @@
+# Full-size synthetic study (controlled ablations, multi-seed).
+extends: ../default.yaml
+name: synthetic-full
+description: Two weeks of simulated plant operation with 80 attack campaigns.
+
+dataset:
+  synthetic:
+    days: 14.0
+    n_attacks: 80
+    drift_strength: 1.0
+
+features:
+  windows: [6, 30, 90]
+  stats: [mean, std, min, max, slope]
+
+copilot:
+  max_events: 150
+
+evaluation:
+  bootstrap_resamples: 1000
