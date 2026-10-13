@@ -23,11 +23,13 @@ details keep that true for real data:
   jump and :func:`cpscopilot.data.features.segment_ids` starts a new segment;
   no window, difference, forward-fill or future label spans the outage, and no
   outage bin becomes a (fake) benign row. Shorter dropouts are kept as empty
-  bins that inherit the previous bin's attack state.
+  bins: for polled sensors they inherit the previous bin's attack state, for
+  event logs (``record_kind: event``) an empty bin is "no traffic" and is an
+  attack only between attack bins.
 * **Flow records are placed at their observable time.** A connection log
   summarises the whole connection (bytes, duration, final state), which is only
   known when it ends; with ``event_duration_col`` each record is shifted to
-  ``ts + duration`` before binning.
+  ``ts + duration`` before binning (attack intervals still match start times).
 
 Decisions about which columns are usable (missingness) are made later on the
 training split only (``features.min_train_coverage``), never on the whole file.
@@ -119,16 +121,20 @@ def _parse_interval_times(values: pd.Series, cfg: DatasetConfig) -> pd.Series:
     text = values.astype(str).str.strip()
     if cfg.attack_intervals_format:
         return pd.to_datetime(text, format=cfg.attack_intervals_format)
-    return pd.to_datetime(text, dayfirst=cfg.dayfirst)
+    try:  # ISO 8601 is unambiguous: never apply dayfirst to it
+        return pd.to_datetime(text, format="ISO8601")
+    except ValueError:
+        return pd.to_datetime(text, dayfirst=cfg.dayfirst)
 
 
 def _apply_attack_intervals(frame: pd.DataFrame, path: Path,
                             cfg: DatasetConfig) -> list[dict[str, Any]]:
     """Label rows inside each ``[start, end]`` interval; every interval must match rows.
 
-    Interval times are parsed with ``attack_intervals_format`` (or the dataset's
-    ``dayfirst`` convention), never with a guessed format, because attack tables
-    and data files often use different day/month orders.
+    Interval times are parsed with ``attack_intervals_format``, as ISO 8601, or with
+    the dataset's ``dayfirst`` convention, never with a guessed format, because
+    attack tables and data files often use different day/month orders. Intervals
+    are matched against record start times (before any ``event_duration_col`` shift).
     """
     intervals = pd.read_csv(path)
     required = {"start", "end"}
@@ -156,6 +162,12 @@ def _apply_attack_intervals(frame: pd.DataFrame, path: Path,
     return report
 
 
+def _record_kind(cfg: DatasetConfig) -> str:
+    if cfg.record_kind is not None:
+        return cfg.record_kind
+    return "event" if cfg.event_duration_col or cfg.name == "ton_iot" else "polled"
+
+
 def _mode_attack_type(values: pd.Series) -> str:
     attacks = values[values != BENIGN_TYPE]
     if attacks.empty:
@@ -173,19 +185,25 @@ def resample_causal(
     count_distinct_cols: list[str] | None = None,
     max_gap_bins: float | None = None,
     stats: dict[str, Any] | None = None,
+    record_kind: str = "polled",
 ) -> tuple[pd.DataFrame, list[str]]:
     """Aggregate rows into right-closed, right-labelled bins of ``seconds``.
 
     Returns the resampled frame and its feature names. The label of a bin is the
     maximum label inside it (any attack activity), the attack type is the most
-    frequent non-benign type, and ``event_count`` counts raw rows per bin.
+    frequent non-benign type, and ``event_count`` counts raw rows per bin. A sum is
+    0 in an empty bin and NaN when the bin has rows but none carries the field, so
+    all aggregates of a field share its missingness.
 
     Args:
         max_gap_bins: runs of ``L`` consecutive empty bins with ``L + 1 >
             max_gap_bins`` (i.e. outages that would start a new segment) are
-            dropped instead of being emitted as empty rows. Shorter runs are kept
-            and inherit the previous bin's label/attack type. ``None`` keeps all.
+            dropped instead of being emitted as empty rows. ``None`` keeps all.
         stats: optional dict that receives bin counts for provenance.
+        record_kind: how kept empty bins are labelled. ``"polled"``: a lost poll
+            inherits the previous bin's label/attack type (an attack does not
+            pause because one poll was lost). ``"event"``: an empty bin means no
+            traffic and is an attack only when attack bins precede and follow it.
     """
     rule = f"{int(seconds)}s"
     indexed = frame.set_index(TIMESTAMP)
@@ -194,7 +212,7 @@ def resample_causal(
     names: list[str] = []
     for agg in aggs:
         if agg == "sum":
-            block = grouper[feature_cols].sum(min_count=0)
+            block = grouper[feature_cols].sum(min_count=1)
         else:
             block = getattr(grouper[feature_cols], agg)()
         if len(aggs) > 1:
@@ -210,12 +228,20 @@ def resample_causal(
         names.append(nunique.name)
     out = pd.concat(parts, axis=1)
     empty = counts.to_numpy() == 0
-    # Short dropouts inherit the previous bin's state (an attack does not pause
-    # because one poll was lost); the first bin always holds the first record.
-    out[LABEL] = grouper[LABEL].max().ffill().fillna(0).astype(np.int8)
+    sum_cols = ([c for c in names if c.endswith("__sum")] if len(aggs) > 1
+                else list(feature_cols) if aggs == ["sum"] else [])
+    out.loc[empty, sum_cols] = 0.0  # no rows in the bin: the sum is 0, not missing
+    # The first bin always holds the first record, so the forward fill is defined.
+    observed = grouper[LABEL].max()
+    if record_kind == "event":
+        label = np.minimum(observed.ffill(), observed.bfill()).fillna(0)
+    else:
+        label = observed.ffill().fillna(0)
+    out[LABEL] = label.astype(np.int8)
     if ATTACK_TYPE in indexed:
         types = grouper[ATTACK_TYPE].apply(_mode_attack_type).reindex(out.index)
-        out[ATTACK_TYPE] = types.where(~empty).ffill().fillna(BENIGN_TYPE)
+        inherited = types.where(~empty).ffill().where(out[LABEL].to_numpy() == 1)
+        out[ATTACK_TYPE] = types.where(~empty, inherited).fillna(BENIGN_TYPE)
     drop = np.zeros(len(out), dtype=bool)
     if max_gap_bins is not None and empty.any():
         anchor = np.cumsum(~empty)  # empty bins share the id of the preceding filled bin
@@ -252,7 +278,9 @@ def _finalise(
         frame, feature_cols = resample_causal(
             frame, feature_cols, cfg.resample_seconds, list(cfg.resample_aggs),
             cfg.count_distinct_cols, max_gap_bins=cfg.max_gap_factor, stats=resample_stats,
+            record_kind=_record_kind(cfg),
         )
+        resample_stats["record_kind"] = _record_kind(cfg)
         fingerprint["resampling"] = resample_stats
         if resample_stats.get("bins_dropped_outage"):
             log.info("dropped %d empty bins inside data outages", resample_stats[
@@ -310,11 +338,6 @@ def _from_table(raw: pd.DataFrame, cfg: DatasetConfig, source: str,
     if cfg.label_col is None and cfg.attack_intervals_path is None:
         raise ValueError("set dataset.label_col or dataset.attack_intervals_path")
     timestamps = _parse_timestamps(raw, cfg)
-    if cfg.event_duration_col:
-        # A flow record is only observable once the connection has ended.
-        duration = pd.to_numeric(raw[cfg.event_duration_col], errors="coerce")
-        timestamps = timestamps + pd.to_timedelta(duration.fillna(0.0).clip(lower=0.0),
-                                                  unit="s")
     columns: dict[str, Any] = {TIMESTAMP: timestamps.to_numpy()}
     if cfg.label_col is not None:
         columns[LABEL] = _binary_labels(raw[cfg.label_col], cfg.positive_labels)
@@ -344,6 +367,12 @@ def _from_table(raw: pd.DataFrame, cfg: DatasetConfig, source: str,
     if cfg.attack_intervals_path:
         fingerprint["attack_intervals"] = _apply_attack_intervals(
             frame, resolve(cfg.attack_intervals_path), cfg)
+    if cfg.event_duration_col:
+        # Intervals describe when records happened (above); a flow record is only
+        # observable once the connection has ended, so it is binned at that time.
+        duration = pd.to_numeric(raw[cfg.event_duration_col], errors="coerce")
+        frame[TIMESTAMP] = frame[TIMESTAMP] + pd.to_timedelta(
+            duration.fillna(0.0).clip(lower=0.0).to_numpy(), unit="s")
     return _finalise(frame, feature_cols, cfg, source, fingerprint, [ATTACK_TYPE],
                      categorical_cols=list(cfg.categorical_cols))
 

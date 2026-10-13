@@ -76,7 +76,7 @@ from cpscopilot.utils.run_manager import RunContext, create_run
 from cpscopilot.utils.seed import make_rng, seed_everything
 
 __all__ = ["ExperimentRunner", "PreparedSplit", "RunResult", "find_cache", "prepare_split",
-           "select_copilot_events"]
+           "select_copilot_events", "train_coverage"]
 
 log = get_logger("pipeline.runner")
 
@@ -162,6 +162,16 @@ def prepare_split(
     )
 
 
+def train_coverage(train: pd.DataFrame, feature_cols: list[str], resampled: bool) -> pd.Series:
+    """Fraction of non-missing values per column on the training split.
+
+    After resampling an empty bin means "no records", not "field missing", so
+    only bins that contain records count.
+    """
+    rows = train["event_count"] > 0 if resampled else slice(None)
+    return train.loc[rows, feature_cols].notna().mean()
+
+
 def find_cache(llm: Any) -> CachedLLM | None:
     """The response cache inside an LLM wrapper chain (fault injection -> cache -> backend)."""
     layer = llm
@@ -229,7 +239,8 @@ class ExperimentRunner:
 
         frames = dict(split.frames)
         # Column usability is decided on the training split only.
-        coverage = frames["train"][dataset.feature_cols].notna().mean()
+        coverage = train_coverage(frames["train"], dataset.feature_cols,
+                                  resampled=bool(cfg.dataset.resample_seconds))
         low_coverage = [c for c in dataset.feature_cols
                         if coverage[c] < cfg.features.min_train_coverage]
         if low_coverage:
@@ -429,10 +440,14 @@ class ExperimentRunner:
         if isinstance(llm, FaultInjectingLLM):
             audit["fault_injection"] = {"rates": cfg.copilot.llm.fault_injection,
                                         "injected": llm.injected}
+        ctx.save_json("copilot_audit.json", audit)
         cache_layer = find_cache(llm)
         if cache_layer is not None:
-            audit["llm_cache"] = {"hits": cache_layer.hits, "misses": cache_layer.misses}
-        ctx.save_json("copilot_audit.json", audit)
+            # Run-time bookkeeping that depends on the cache state, not on the
+            # experiment: kept out of copilot_audit.json and metrics.json so that a
+            # same-seed rerun with a warm cache reproduces the metrics exactly.
+            ctx.save_json("llm_cache_stats.json", {"hits": cache_layer.hits,
+                                                   "misses": cache_layer.misses})
         return audit
 
     # -------------------------------------------------------------------- run

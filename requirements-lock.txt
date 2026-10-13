@@ -1,4 +1,4 @@
-# Exact versions the full test suite (150 tests) passed with, on CPython 3.13.16 / Linux x86_64.
+# Exact versions the full test suite (173 tests) passed with, on CPython 3.13.16 / Linux x86_64.
 # The suite also passes on CPython 3.11 with pandas 2.3 / NumPy 1.26 / scikit-learn 1.5 /
 # XGBoost 2.1 / matplotlib 3.9 (the 'legacy stack' CI job).
 # Install with: pip install -r requirements-lock.txt

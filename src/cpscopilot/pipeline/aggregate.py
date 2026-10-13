@@ -38,24 +38,33 @@ def flatten_numeric(obj: Any, prefix: str = "") -> dict[str, float]:
 
 
 def check_independent_runs(metrics: list[dict[str, Any]], allow_duplicates: bool = False) -> None:
-    """Refuse repeated runs or seeds: identical replicas would shrink the s.d. and CI."""
-    if allow_duplicates:
-        return
+    """Refuse repeated runs, and repeated seeds within one configuration.
+
+    The same run passed twice is always refused. Two runs of one configuration with
+    the same seed are exact replicas that would shrink the s.d. and CI; they are
+    accepted only with ``allow_duplicates`` (e.g. a determinism check). Different
+    configurations may share seeds (``allow_mixed`` comparisons).
+    """
     run_ids = [m["run_id"] for m in metrics]
-    seeds = [m["seed"] for m in metrics]
     if len(set(run_ids)) != len(run_ids):
         raise ValueError(f"the same run was passed more than once: {sorted(run_ids)}")
-    if len(set(seeds)) != len(seeds):
-        raise ValueError(f"seeds repeat across runs {sorted(seeds)}; repeated seeds are exact "
-                         "replicas and would understate the across-seed variance")
+    if allow_duplicates:
+        return
+    keys = [(m["config_hash"], m["seed"]) for m in metrics]
+    repeated = sorted({k for k in keys if keys.count(k) > 1})
+    if repeated:
+        raise ValueError(
+            f"seeds repeat within one configuration {[(h[:12], s) for h, s in repeated]}; "
+            "repeated seeds are exact replicas and would understate the across-seed variance")
 
 
 def aggregate_runs(run_dirs: list[Path], confidence: float = 0.95, allow_mixed: bool = False,
                    allow_duplicates: bool = False) -> tuple[dict[str, Any], pd.DataFrame]:
     """Return ``(summary, table)`` where ``table`` has one row per metric.
 
-    Runs must share a configuration hash and be independent (distinct run ids and
-    distinct seeds) unless explicitly allowed.
+    Runs must share a configuration hash (unless ``allow_mixed``) and be
+    independent: distinct runs, and distinct seeds within each configuration
+    (unless ``allow_duplicates``).
     """
     if not run_dirs:
         raise ValueError("no runs to aggregate")

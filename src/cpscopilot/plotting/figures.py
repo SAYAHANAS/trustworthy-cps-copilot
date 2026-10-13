@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -598,9 +599,11 @@ def generate_all(run_dirs: list[Path], out_dir: Path | None = None,
                  only: list[str] | None = None, allow_duplicates: bool = False) -> Path:
     """Render every figure for the given runs into a new directory.
 
-    Figures are rendered into a temporary sibling directory that is renamed to
-    ``out_dir`` only when every figure succeeded, so a failure never leaves a
-    partial output behind.
+    Figures are rendered into a staging directory and published only when every
+    figure succeeded, so a failure never leaves a partial output behind: a new
+    ``out_dir`` is created by renaming a sibling ``.partial`` directory, an existing
+    empty one (``.``, a mount point, a symlink) receives the files from a hidden
+    staging directory inside it.
     """
     global _USETEX
     formats = formats or ["pdf", "svg"]
@@ -614,21 +617,31 @@ def generate_all(run_dirs: list[Path], out_dir: Path | None = None,
         tag = hashlib.sha256(ids.encode()).hexdigest()[:8]
         root = runs[0].run_dir.parent.parent / "figures"
         out_dir = root / f"{utc_stamp()}_{runs[0].metrics['experiment']}_{tag}"
-    final_dir = Path(out_dir)
+    final_dir = Path(out_dir).resolve()
     if final_dir.exists() and any(final_dir.iterdir()):
         raise FileExistsError(f"{final_dir} is not empty; figures are never overwritten")
-    out_dir = final_dir.with_name(final_dir.name + ".partial")
-    if out_dir.exists():
-        raise FileExistsError(f"{out_dir} exists (an interrupted earlier call?); remove it")
-    out_dir.mkdir(parents=True)
+    if final_dir.exists():  # empty: may be ".", a mount point, a symlink or unwritable parent
+        stage = Path(tempfile.mkdtemp(prefix=".partial-", dir=final_dir))
+    else:
+        stage = final_dir.with_name(final_dir.name + ".partial")
+        if stage.exists():
+            raise FileExistsError(f"{stage} exists (an interrupted earlier call?); remove it")
+        stage.mkdir(parents=True)
+    moved: list[Path] = []
     try:
-        _render(runs, out_dir, formats, latex, only, hashes[0])
+        _render(runs, stage, formats, latex, only, hashes[0])
+        if stage.parent == final_dir:
+            for path in sorted(stage.iterdir()):
+                moved.append(final_dir / path.name)
+                path.rename(moved[-1])
+            stage.rmdir()
+        else:
+            stage.rename(final_dir)
     except BaseException:
-        shutil.rmtree(out_dir, ignore_errors=True)
+        shutil.rmtree(stage, ignore_errors=True)
+        for path in moved:
+            path.unlink(missing_ok=True)
         raise
-    if final_dir.exists():
-        final_dir.rmdir()  # empty (checked above)
-    out_dir.rename(final_dir)
     return final_dir
 
 

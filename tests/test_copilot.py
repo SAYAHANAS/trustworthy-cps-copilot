@@ -227,12 +227,66 @@ def test_autonomous_phrasings_are_forced_to_approval(chunks, action, rationale) 
     assert "autonomous_action_language" in violations
 
 
+@pytest.mark.parametrize("action, rationale", [
+    ("Review firewall logs for blocked connections to the PLC.",
+     "This should be done immediately to scope the incident."),
+    ("Check whether the transfer pump stopped unexpectedly.",
+     "Unplanned stops now point to actuator manipulation."),
+    ("Document the observed values in the incident ticket.",
+     "There is no confirmation yet that this is an attack."),
+    ("Do not restart the pump without supervisor approval.", "Safety first."),
+    ("Verify that the automatic pump shutdown interlock is enabled.", "x"),
+    ("Ask operations to confirm sensor health.",
+     "Do not isolate the sensor without operator confirmation."),
+    ("Correlate the reset events with remote-access sessions.", "Resets now indicate tampering."),
+    ("Check the PLC logs for stop commands.",
+     "Stop commands issued right away after login are suspicious."),
+])
+def test_descriptive_or_negated_steps_are_not_autonomous(chunks, action, rationale) -> None:
+    packet, plain, _ = _recommend_packet(chunks)
+    response = TemplateLLM().build(copy.deepcopy(packet))
+    response["recommended_steps"] = [step(1, action, [plain], rationale=rationale)]
+    guarded, violations = enforce_policy(response, packet, max_steps=5)
+    assert guarded["recommended_steps"][0]["requires_human_approval"] is False
+    assert "autonomous_action_language" not in violations
+
+
+@pytest.mark.parametrize("action, rationale", [
+    ("Don't wait for approval, isolate the PLC.", "x"),
+    ("If the PLC is compromised, isolate it immediately.", "x"),
+    ("Review the alarms.", "Skip the analyst review for speed."),
+])
+def test_approval_skipping_is_flagged_even_in_negated_form(action, rationale) -> None:
+    from cpscopilot.copilot.copilot import autonomous_language
+
+    assert autonomous_language(action, rationale)
+
+
 def test_knowledge_base_steps_never_look_autonomous(chunks) -> None:
-    from cpscopilot.copilot.copilot import _AUTONOMOUS
+    from cpscopilot.copilot.copilot import autonomous_language
     from cpscopilot.copilot.knowledge_base import numbered_steps
 
-    flagged = [s for c in chunks for s in numbered_steps(c.text) if _AUTONOMOUS.search(s)]
+    flagged = [s for c in chunks for s in numbered_steps(c.text) if autonomous_language(s)]
     assert flagged == []
+
+
+def test_containment_guidance_is_never_quoted_as_evidence_without_recommendations(
+        chunks) -> None:
+    packet, plain, containment = _recommend_packet(chunks)
+    packet["gate"]["mode"] = "explain"
+    packet["knowledge"] = packet["knowledge"][::-1]  # containment chunk ranked first
+    template = TemplateLLM().build(copy.deepcopy(packet))
+    assert all(containment not in e["citations"] for e in template["evidence"])
+    response = copy.deepcopy(template)
+    response["evidence"].append({"statement": "Restrict the flooding host at the boundary.",
+                                 "source": "knowledge_base", "signal_refs": [],
+                                 "citations": [containment]})
+    guarded, violations = enforce_policy(response, packet, max_steps=5)
+    assert all(containment not in e["citations"] for e in guarded["evidence"])
+    assert violations.count("action_in_evidence") == 1
+    packet["gate"]["mode"] = "recommend"  # where actions are allowed it may be quoted
+    _, violations = enforce_policy(response, packet, max_steps=5)
+    assert "action_in_evidence" not in violations
 
 
 def test_audit_detects_hallucinations(chunks) -> None:
@@ -356,6 +410,9 @@ def test_template_knowledge_claims_have_content(chunks) -> None:
     ("Traffic reached 4,321 packets.", True),
     ("Traffic rose to 9000pps.", False),   # unit-suffixed invented number is seen
     ("Delay of 250ms.", False),
+    ("Traffic reached 4.3k packets.", True),   # SI multiplier: 4321 to the hundred
+    ("Traffic reached 9.9k packets.", False),
+    ("Probabilities (0.95,0.7319).", False),   # list items after a bare comma are checked
 ])
 def test_number_grounding_handles_signs_separators_and_units(chunks, text, grounded) -> None:
     copilot = make_copilot(chunks, TemplateLLM())

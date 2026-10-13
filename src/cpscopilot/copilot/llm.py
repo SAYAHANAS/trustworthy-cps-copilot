@@ -153,13 +153,12 @@ class TemplateLLM:
                 "statement": f"Prediction model: probability {_f(p_peak)} of an attack within "
                              f"{horizon_min:g} minutes.",
                 "source": "prediction", "signal_refs": [f"p_future.{horizon}"], "citations": []})
-        if knowledge and mode != "monitor":
-            top = knowledge[0]
-            items = numbered_steps(top["text"])
-            if items:  # a list section: quote its first item, not the "1." marker
-                first = items[0]
-            else:
-                first = re.split(r"(?<=[.!?])\s+", top["text"].strip())[0]
+        # Quote descriptive guidance only: list sections are instructions (containment
+        # lists need approval) and must not appear as "evidence" in any mode.
+        top = next((k for k in knowledge
+                    if not k["requires_approval"] and not numbered_steps(k["text"])), None)
+        if top is not None and mode != "monitor":
+            first = re.split(r"(?<=[.!?])\s+", top["text"].strip())[0]
             evidence.append({"statement": first, "source": "knowledge_base", "signal_refs": [],
                              "citations": [top["chunk_id"]]})
         steps: list[dict[str, Any]] = []

@@ -32,14 +32,16 @@ __all__ = ["LexicalSupportScorer", "SupportScorer", "aggregate_audits", "audit_r
            "extract_entities", "extract_numbers", "ungrounded_spans"]
 
 # A standalone number: optional sign, optional thousands separators, optional
-# percent sign or short unit suffix ("250ms", "9000pps", "3x"); never part of an
-# identifier such as FIT101, T0856 or 1_AIT_001_PV.
+# percent sign or short unit suffix ("250ms", "9000pps", "3x", "4.3k"); never part
+# of an identifier such as FIT101, T0856 or 1_AIT_001_PV. A comma without a
+# following 3-digit group separates list items ("(0.95,0.73)" gives two numbers).
 _NUMBER = re.compile(
-    r"(?<![A-Za-z0-9_.,])(-?)(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(%?)"
-    r"(?:[A-Za-z]{1,4})?(?![A-Za-z0-9_])(?!\.\d)(?!,\d{3})"
+    r"(?<![A-Za-z0-9_.])(-?)(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(%?)"
+    r"([A-Za-z]{1,4})?(?![A-Za-z0-9_])(?!\.\d)(?!,\d{3})"
 )
 _ENTITY = re.compile(r"\b(?:[A-Za-z][A-Za-z0-9_]*\d[A-Za-z0-9_]*|[A-Z][A-Z0-9]*_[A-Za-z0-9_]+)\b")
 _TRIVIAL_INTEGERS = set(range(0, 11))
+_MULTIPLIERS = {"k": 3, "K": 3, "M": 6, "G": 9}  # SI suffixes: "4.3k" is 4300 to the 100
 
 
 class SupportScorer(Protocol):
@@ -57,12 +59,19 @@ class LexicalSupportScorer:
 
 
 def extract_numbers(text: str) -> list[tuple[float, int, bool]]:
-    """``(signed value, decimals, is_percent)`` for each standalone number."""
+    """``(signed value, decimals, is_percent)`` for each standalone number.
+
+    ``decimals`` is the rounding precision of the written number; it is negative
+    for SI multipliers ("4.3k" -> ``(4300.0, -2, False)``).
+    """
     out = []
     for m in _NUMBER.finditer(text):
         digits = m.group(2).replace(",", "")
         decimals = len(digits.split(".")[1]) if "." in digits else 0
         value = float(digits) * (-1.0 if m.group(1) == "-" else 1.0)
+        exponent = _MULTIPLIERS.get(m.group(4) or "", 0)
+        if exponent:
+            value, decimals = round(value * 10.0 ** exponent, 6), decimals - exponent
         out.append((value, decimals, m.group(3) == "%"))
     return out
 
@@ -130,7 +139,7 @@ def ungrounded_spans(response: dict[str, Any], packet: dict[str, Any]) -> dict[s
         for value, decimals, pct in extract_numbers(text):
             n_numbers += 1
             if not _number_grounded(value, decimals, allowed):
-                bad_numbers.append(f"{value:.{decimals}f}{'%' if pct else ''}")
+                bad_numbers.append(f"{value:.{max(decimals, 0)}f}{'%' if pct else ''}")
         entities |= extract_entities(text)
     return {"n_numbers": n_numbers, "numbers": bad_numbers, "n_entities": len(entities),
             "entities": sorted(e for e in entities if e not in packet_entities)}

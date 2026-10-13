@@ -12,7 +12,10 @@ dataset:
   max_gap_factor: 5.0          # timestamp gap (x sampling period) that starts a new segment;
                                # with resampling, longer runs of empty bins are dropped
   event_duration_col: null     # flow logs: bin each record at ts + this duration (seconds)
-  attack_intervals_format: null  # strptime format of an attack-interval file (null: dayfirst)
+  record_kind: null            # polled | event: how kept empty bins are labelled
+                               # (null: event with event_duration_col or ton_iot, else polled)
+  attack_intervals_format: null  # strptime format of an attack-interval file
+                                 # (null: ISO 8601, else the dataset's dayfirst)
   synthetic:
     days: 4.0
     sampling_seconds: 10

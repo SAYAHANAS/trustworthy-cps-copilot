@@ -144,7 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", help="CSV path (must not exist)")
     p.add_argument("--allow-mixed", action="store_true")
     p.add_argument("--allow-duplicates", action="store_true",
-                   help="accept repeated runs/seeds (they are not independent samples)")
+                   help="accept repeated seeds within one configuration (replicas are not "
+                        "independent samples)")
     p.set_defaults(func=_cmd_aggregate)
 
     p = sub.add_parser("figures", help="publication figures from run directories")
@@ -154,7 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["pdf", "svg", "pgf", "png", "eps"])
     p.add_argument("--latex", choices=["auto", "on", "off"], default="auto")
     p.add_argument("--allow-duplicates", action="store_true",
-                   help="accept repeated runs/seeds (they are not independent samples)")
+                   help="accept repeated seeds within one configuration (replicas are not "
+                        "independent samples)")
     p.set_defaults(func=_cmd_figures)
 
     p = sub.add_parser("verify", help="re-hash a run directory against its manifest")

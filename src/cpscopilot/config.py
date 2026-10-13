@@ -107,9 +107,15 @@ class DatasetConfig(_Strict):
     event_duration_col: str | None = Field(
         None, description="Flow records (e.g. Zeek conn logs) only become observable when the "
                           "connection ends: shift each record's time by this column (seconds).")
+    record_kind: Literal["polled", "event"] | None = Field(
+        None, description="'polled': sensor polls, a short run of empty bins is a lost poll and "
+                          "inherits the previous state. 'event': flow/log records, an empty bin "
+                          "means no traffic and is an attack only between attack bins. None = "
+                          "'event' when event_duration_col is set or for ton_iot, else 'polled'.")
     attack_intervals_path: str | None = None
     attack_intervals_format: str | None = Field(
-        None, description="strptime format of the interval file; None = infer with dayfirst.")
+        None, description="strptime format of the interval file; None = ISO 8601, else the "
+                          "dataset's dayfirst convention.")
     read_csv_kwargs: dict[str, Any] = Field(default_factory=dict)
     synthetic: SyntheticConfig = Field(default_factory=SyntheticConfig)
 

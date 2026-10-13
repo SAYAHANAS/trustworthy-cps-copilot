@@ -41,7 +41,8 @@ from cpscopilot.copilot.schemas import CopilotResponse, strict_json_schema
 from cpscopilot.gate.policy import AssistanceMode, GateDecision
 from cpscopilot.trust.asset import AssetRegistry
 
-__all__ = ["DEFAULT_GLOSSARY", "CognitiveCopilot", "CopilotResult", "enforce_policy"]
+__all__ = ["DEFAULT_GLOSSARY", "CognitiveCopilot", "CopilotResult", "autonomous_language",
+           "enforce_policy"]
 
 DEFAULT_GLOSSARY: dict[str, str] = {
     r"^LIT": "level transmitter tank level sensor reading",
@@ -58,23 +59,56 @@ DEFAULT_GLOSSARY: dict[str, str] = {
     r"(?i)http": "http web requests injection",
 }
 
-# Phrases that describe a containment action taken without a human in the loop, in
-# either word order ("automatically block" / "block ... automatically|immediately|now")
-# or explicitly skipping approval. Plain uses of "automatic" (e.g. "automatic control
-# loops") are not matched. The check is conservative: a match only forces approval.
-_ACTION_VERB = (r"(?:block|isolat|shut\s*(?:down|off)|disconnect|quarantin|stop|kill|disabl|"
-                r"terminat|cut\s+off|null-?rout|reset|reboot|restart|power\s*(?:off|down))\w*")
-_AUTONOMOUS = re.compile(
-    rf"\bautomatic(?:ally)?\b.{{0,40}}?\b{_ACTION_VERB}"
-    rf"|\b{_ACTION_VERB}\b.{{0,60}}?\b(?:automatic(?:ally)?|immediately|right\s+away|"
-    r"at\s+once|now)\b"
-    rf"|\bauto-?{_ACTION_VERB}"
-    rf"|\bimmediately\b.{{0,20}}?\b{_ACTION_VERB}"
-    r"|\bwithout\b.{0,30}?\b(?:approval|review|confirmation|authori[sz]ation|consent|"
-    r"sign-?off)\b"
-    r"|\bno\s+(?:need\s+(?:for|to\s+wait\s+for)\s+)?(?:approval|confirmation|review)\b",
-    re.IGNORECASE | re.DOTALL,
+# Autonomous-action language: a step that tells someone to act without a human in
+# the loop. Each clause (split at . ; ! ? ,) is checked on its own so that patterns
+# never span sentences, and negated clauses ("do not restart the pump without
+# approval") are ignored, except for explicit approval skipping ("don't wait for
+# approval"). Base-form verbs only, so descriptions ("blocked connections", "the
+# pump stopped", "automatic shutdown interlock") are not matched. Imperatives with
+# an urgency adverb ("Isolate the PLC immediately") are checked in the action only;
+# a rationale explains and often says "now" descriptively. A match only forces
+# approval, so the check errs on the conservative side.
+_VERB = (r"(?:block|isolate|shut\s*(?:down|off)|disconnect|quarantine|stop|kill|disable|"
+         r"terminate|cut\s+off|null-?route|reset|reboot|restart|power\s*(?:off|down))")
+_APPROVAL = r"(?:approval|review|confirmation|authori[sz]ation|consent|sign-?off)"
+_SKIPS_APPROVAL = re.compile(
+    rf"\bno\s+need\s+(?:for|to\s+(?:wait\s+for|get|obtain|request|seek))\s+(?:\w+\s+)?"
+    rf"{_APPROVAL}\b"
+    rf"|\b(?:do\s+not|don't|never)\s+wait\s+for\s+(?:\w+\s+)?{_APPROVAL}\b"
+    rf"|\bskip\s+(?:the\s+)?(?:\w+\s+)?{_APPROVAL}\b",
+    re.IGNORECASE,
 )
+_AUTONOMOUS_ANYWHERE = re.compile(
+    rf"\bautomatically\s+(?:\w+\s+){{0,2}}?{_VERB}\b"
+    rf"|\bauto-?{_VERB}\b"
+    rf"|\bimmediately\s+(?:\w+\s+)?{_VERB}\b"
+    rf"|\bwithout\b.{{0,30}}?\b{_APPROVAL}\b",
+    re.IGNORECASE,
+)
+_IMPERATIVE_NOW = re.compile(
+    rf"\W*(?:(?:then|and|so|please)\s+)*{_VERB}\b.{{0,60}}?\b(?:automatically|immediately|"
+    r"right\s+away|at\s+once|now|without\s+delay)\b",
+    re.IGNORECASE,
+)
+_NEGATION = re.compile(r"\b(?:do\s+not|don't|never|must\s+not|mustn't|should\s+not|"
+                       r"shouldn't|cannot|can't|avoid)\b", re.IGNORECASE)
+_CLAUSE_BREAK = re.compile(r"[.;!?,\n]+")
+
+
+def autonomous_language(action: str, rationale: str = "") -> bool:
+    """Whether a recommended step asks for action without a human in the loop."""
+    for text, imperative in ((action, True), (rationale, False)):
+        for clause in (c.strip() for c in _CLAUSE_BREAK.split(text or "")):
+            if not clause:
+                continue
+            if _SKIPS_APPROVAL.search(clause):
+                return True
+            if _NEGATION.search(clause):
+                continue
+            if _AUTONOMOUS_ANYWHERE.search(clause) or (
+                    imperative and _IMPERATIVE_NOW.match(clause)):
+                return True
+    return False
 
 
 def _r(x: Any) -> float:
@@ -144,15 +178,23 @@ def enforce_policy(response: dict[str, Any], packet: dict[str, Any],
     if out.get("abstained"):
         violations.append("self_abstention")
 
+    evidence = []
     for item in out.get("evidence", []):
         kept = [c for c in item["citations"] if c in retrieved]
         if len(kept) != len(item["citations"]):
             violations.append("fabricated_citation")
+        if set(kept) & approval_chunks and not mode.allows_recommendations:
+            # quoting containment guidance would smuggle an action into a mode without them
+            violations.append("action_in_evidence")
+            continue
         item["citations"] = kept
         refs = [r for r in item["signal_refs"] if r in allowed_refs]
         if len(refs) != len(item["signal_refs"]):
             violations.append("invalid_signal_ref")
         item["signal_refs"] = refs
+        evidence.append(item)
+    if "evidence" in out:
+        out["evidence"] = evidence
 
     if not mode.allows_explanation and out.get("threat_explanation"):
         violations.append("explanation_not_permitted")
@@ -171,7 +213,7 @@ def enforce_policy(response: dict[str, Any], packet: dict[str, Any],
             violations.append("uncited_step")
             continue
         step["citations"] = kept
-        if _AUTONOMOUS.search(f"{step['action']} {step.get('rationale', '')}"):
+        if autonomous_language(step["action"], step.get("rationale", "")):
             violations.append("autonomous_action_language")
             step["requires_human_approval"] = True
         if set(kept) & approval_chunks and not step["requires_human_approval"]:

@@ -170,3 +170,98 @@ def test_label_columns_can_never_be_features() -> None:
                           "x": [1.0, 2.0, 3.0], LABEL: [0, 1, 0]})
     with pytest.raises(ValueError):
         CPSDataset(frame=frame, feature_cols=["x", LABEL], sampling_seconds=1.0, source="t")
+
+
+def test_iso_interval_tables_are_never_read_day_first(tmp_path: Path) -> None:
+    ts = pd.date_range("2026-01-02 08:00", "2026-01-02 11:00", freq="10min").append(
+        pd.date_range("2026-02-01 08:00", "2026-02-01 11:00", freq="10min"))
+    pd.DataFrame({"time": ts.strftime("%d/%m/%Y %H:%M:%S"), "x": np.arange(len(ts), dtype=float)}
+                 ).to_csv(tmp_path / "plant.csv", index=False)
+    pd.DataFrame({"start": ["2026-02-01 08:00:00", "2026-01-02 10:00:00"],
+                  "end": ["2026-02-01 08:20:00", "2026-01-02 10:30:00"],
+                  "attack_type": ["a2", "a1"]}).to_csv(tmp_path / "attacks.csv", index=False)
+    cfg = DatasetConfig(name="generic_csv", paths=["plant.csv"], timestamp_col="time",
+                        dayfirst=True, attack_intervals_path="attacks.csv")
+    f = load_dataset(cfg, resolver(tmp_path), 0).frame
+    attacks = f[f[LABEL] == 1].groupby("attack_type")[TIMESTAMP]
+    assert attacks.min().to_dict() == {"a1": pd.Timestamp("2026-01-02 10:00"),
+                                       "a2": pd.Timestamp("2026-02-01 08:00")}
+
+
+def _flows(tmp_path: Path, raw: pd.DataFrame, **extra) -> CPSDataset:
+    raw.to_csv(tmp_path / "net.csv", index=False)
+    cfg = DatasetConfig(name="ton_iot", paths=["net.csv"], timestamp_col="ts",
+                        timestamp_unit="s", label_col="label", positive_labels=[1],
+                        attack_type_col="type", resample_seconds=10,
+                        resample_aggs=["sum", "mean"], max_gap_factor=60, **extra)
+    return load_dataset(cfg, resolver(tmp_path), 0)
+
+
+def test_flow_bins_without_traffic_are_not_attacks_unless_bracketed(tmp_path: Path) -> None:
+    t0 = 1556000000
+    benign = list(range(0, 100, 2))
+    times = benign + [101, 103, 105] + [t + 600 for t in benign] + [701, 731] + [
+        t + 800 for t in benign]
+    label = [0] * 50 + [1, 1, 1] + [0] * 50 + [1, 1] + [0] * 50
+    raw = pd.DataFrame({"ts": [t0 + t for t in times], "duration": 0.0,
+                        "src_bytes": 1.0, "label": label,
+                        "type": ["scanning" if v else "normal" for v in label]})
+    ds = _flows(tmp_path, raw)
+    assert ds.fingerprint["resampling"]["record_kind"] == "event"
+    f = ds.frame.set_index(TIMESTAMP)
+    silent = f["event_count"] == 0
+    # a burst followed by silence: only the bin holding the burst is an attack
+    assert f.loc[pd.Timestamp(t0 + 110, unit="s"), LABEL] == 1  # holds 101, 103, 105
+    after_burst = f.loc[pd.Timestamp(t0 + 120, unit="s"): pd.Timestamp(t0 + 590, unit="s")]
+    assert after_burst["event_count"].eq(0).all() and after_burst[LABEL].eq(0).all()
+    assert set(after_burst["attack_type"]) == {"normal"}
+    # silence *between* two attack bins (701 -> bin 710, 731 -> bin 740) stays an attack
+    between = f.loc[pd.Timestamp(t0 + 710, unit="s"): pd.Timestamp(t0 + 740, unit="s")]
+    assert between[LABEL].tolist() == [1, 1, 1, 1]
+    assert set(between["attack_type"]) == {"scanning"}
+    assert int(f.loc[silent, LABEL].sum()) == 2  # only the two bracketed silent bins
+    assert (f.loc[silent, "src_bytes__sum"] == 0).all()  # no traffic: the sum is 0
+
+
+def test_sums_are_missing_when_records_lack_the_field(tmp_path: Path) -> None:
+    from cpscopilot.pipeline.runner import train_coverage
+
+    t0 = 1556000000
+    n = 400
+    times = np.r_[np.arange(0, 2 * n, 4), np.arange(2 * n + 400, 4 * n + 400, 4)]
+    body = np.where(times < 0.7 * times.max(), np.nan, 5.0)  # field absent early on
+    raw = pd.DataFrame({"ts": t0 + times, "duration": 0.5, "src_bytes": 10.0,
+                        "http_len": body, "label": 0, "type": "normal"})
+    raw.loc[::50, "label"] = 1
+    f = _flows(tmp_path, raw).frame
+    rows = f[f["event_count"] > 0]
+    early = rows[TIMESTAMP] < pd.Timestamp(t0 + 0.6 * times.max(), unit="s")
+    assert rows.loc[early, "http_len__sum"].isna().all()  # not a fake 0
+    assert (f.loc[f["event_count"] == 0, "http_len__sum"] == 0).all()
+    train = f.iloc[: int(0.6 * len(f))]
+    coverage = train_coverage(train, ["src_bytes__sum", "src_bytes__mean", "http_len__sum",
+                                      "http_len__mean"], resampled=True)
+    # silent bins do not count as missing; all aggregates of a field share its coverage
+    assert coverage["src_bytes__mean"] == 1.0 == coverage["src_bytes__sum"]
+    assert coverage["http_len__sum"] == coverage["http_len__mean"] == 0.0
+
+
+def test_attack_intervals_match_flow_start_times(tmp_path: Path) -> None:
+    t0 = pd.Timestamp("2026-01-01 10:00:00")
+    starts = [t0 + pd.Timedelta(seconds=s) for s in range(0, 1800, 5)] + [
+        t0 + pd.Timedelta(seconds=1203)]
+    raw = pd.DataFrame({"ts": [str(t) for t in starts], "duration": [0.5] * 360 + [900.0],
+                        "bytes": [10.0] * 360 + [1e7]})
+    raw.to_csv(tmp_path / "net.csv", index=False)
+    pd.DataFrame({"start": ["2026-01-01 10:20:01"], "end": ["2026-01-01 10:20:04"],
+                  "attack_type": ["exfiltration"]}).to_csv(tmp_path / "attacks.csv", index=False)
+    cfg = DatasetConfig(name="generic_csv", paths=["net.csv"], timestamp_col="ts",
+                        event_duration_col="duration", attack_intervals_path="attacks.csv",
+                        resample_seconds=10, resample_aggs=["sum"])
+    ds = load_dataset(cfg, resolver(tmp_path), 0)
+    assert ds.fingerprint["attack_intervals"][0]["rows_matched"] == 1  # the long flow only
+    f = ds.frame.set_index(TIMESTAMP)
+    end_bin = pd.Timestamp("2026-01-01 10:35:10")  # 10:20:03 + 900 s, right-labelled
+    assert f.loc[end_bin, "bytes"] >= 1e7 and f.loc[end_bin, LABEL] == 1
+    assert f.loc[end_bin, "attack_type"] == "exfiltration"
+    assert int(f[LABEL].sum()) == 1

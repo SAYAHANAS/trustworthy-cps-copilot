@@ -35,7 +35,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--latex", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--only", nargs="+", choices=sorted(FIGURES), help="subset of figures")
     parser.add_argument("--allow-duplicates", action="store_true",
-                        help="accept repeated runs/seeds (they are not independent samples)")
+                        help="accept repeated seeds within one configuration (replicas "
+                             "are not independent samples)")
     args = parser.parse_args(argv)
     out = generate_all(args.runs, args.out, formats=args.formats, latex=args.latex,
                        only=args.only, allow_duplicates=args.allow_duplicates)

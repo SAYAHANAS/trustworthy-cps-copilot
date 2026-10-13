@@ -14,6 +14,7 @@ dataset:
   timestamp_col: ts
   timestamp_unit: s
   event_duration_col: duration   # bin each flow at ts + duration (when it is observable)
+  record_kind: event             # an empty bin means "no traffic", not a lost poll
   label_col: label
   positive_labels: [1]
   attack_type_col: type

@@ -31,7 +31,7 @@ support. The analyst makes every decision.
 
 ```bash
 pip install -r requirements-lock.txt      # exact tested versions (or: pip install -e ".[dev,llm]")
-make test                                 # 150 tests, ~1 min
+make test                                 # 173 tests, ~2 min
 make smoke                                # one end-to-end run on the synthetic plant
 python scripts/generate_paper_figures.py runs/<run_id> --formats pdf svg pgf
 ```
@@ -58,9 +58,9 @@ PYTHONPATH=src python -m cpscopilot.cli verify runs/<run_id>
 |---|---|---|
 | Shuffled or overlapping splits | contiguous chronological blocks, train → calibration → test, with `embargo_steps` purged rows between them (default: max(feature warm-up + 1, longest horizon)) | `split_audit.json`; `tests/test_splitting.py` |
 | Rolling windows reading the future | trailing windows only (`center=False`, full-window `min_periods`), causal forward-fill, features computed *inside* each split and contiguous segment; warm-up rows dropped | runtime truncation + future-perturbation audit on random rows of every split (`leakage_audit.json`); `tests/test_features_no_leakage.py` |
-| Resampling across outages or before data exist | right-closed bins labelled at their right edge; runs of empty bins longer than `max_gap_factor` periods are dropped (never filled with fake benign rows) so a new segment starts; flow records (e.g. TON_IoT/Zeek) are binned at `ts + duration`, when they become observable (`event_duration_col`) | `fingerprint.resampling` in `data_fingerprint.json`; `tests/test_loaders.py` |
+| Resampling across outages or before data exist | right-closed bins labelled at their right edge; runs of empty bins longer than `max_gap_factor` periods are dropped (never filled with fake benign rows) so a new segment starts; flow records (e.g. TON_IoT/Zeek) are binned at `ts + duration`, when they become observable (`event_duration_col`), while attack intervals are matched to start times; for event logs (`record_kind: event`) a silent bin is an attack only between attack bins | `fingerprint.resampling` in `data_fingerprint.json`; `tests/test_loaders.py` |
 | Labels crossing the split boundary | future labels use the strictly future in-segment window `(t, t+h]`; rows whose horizon leaves the split are undefined and dropped | brute-force label audit; `tests/test_labels.py` |
-| Statistics fitted on held-out data | imputer, scaler, one-hot vocabulary, models and anomaly scorer refuse to fit on anything but `train`; columns with too little data are dropped based on train coverage only (`features.min_train_coverage`); calibrators only on `calibration`; a fit ledger records every fit | `fit_ledger.json`, audit check `nothing_fitted_on_test`; `tests/test_preprocessing.py` |
+| Statistics fitted on held-out data | imputer, scaler, one-hot vocabulary, models and anomaly scorer refuse to fit on anything but `train`; columns with too little data are dropped based on train coverage only (`features.min_train_coverage`, over bins that contain records; a sum is NaN when no record carries the field); calibrators only on `calibration`; a fit ledger records every fit | `fit_ledger.json`, audit check `nothing_fitted_on_test`; `tests/test_preprocessing.py` |
 | Label/metadata used as input | metadata columns (`attack_type`, `phase`, …) cannot be features; label-proxy screen on train | `CPSDataset` validation, audit check `no_label_or_meta_features` |
 | Test data tuning thresholds | state thresholds, gate thresholds, alert budget and the epistemic reference are chosen on the calibration split | `trust_state.json`, `gate_thresholds.json` |
 | Ground truth reaching the copilot | evidence packets contain model outputs and sensor deviations only; the retrieval index is built from the knowledge base only | `tests/test_copilot.py::test_packet_never_contains_ground_truth` |
@@ -91,7 +91,8 @@ the run *before* metrics are computed.
   dirty flag), `seed_state.json`, `knowledge_base.json` (playbook hashes).
 * **LLM outputs** — API models are not bit-reproducible, so responses are stored in an
   append-only cache keyed by the SHA-256 of the full request (`llm_cache/`); re-running
-  with the cache reproduces copilot outputs exactly.
+  with the cache reproduces copilot outputs exactly. Cache hits/misses go to
+  `llm_cache_stats.json`, not to `metrics.json`, so a warm cache does not change the metrics.
 
 ## Trust layer and gate in brief
 
@@ -123,10 +124,13 @@ the run *before* metrics are computed.
   `fallbacks: "default"` — disable with `copilot.llm.use_refusal_fallback=false`).
   Set `ANTHROPIC_API_KEY` (or log in with `ant auth login`) and run with
   `--set copilot.llm.backend=anthropic`.
-* Guardrails (`enforce_policy`): mode-forbidden content removed, uncited steps dropped,
+* Guardrails (`enforce_policy`): mode-forbidden content removed (including evidence that
+  quotes containment guidance in modes without recommendations), uncited steps dropped,
   fabricated citations and unknown signal references removed, approval forced for steps
   that cite containment/response/recovery guidance, for analyst profiles and modes that
-  require it, and for autonomous-action phrasing in the action or its rationale;
+  require it, and for autonomous-action phrasing in the action or its rationale
+  (checked clause by clause; negated clauses such as "do not restart without approval"
+  are not flagged);
   confidence overwritten with the trust layer's value; ungrounded numbers/identifiers
   flagged. Abstain mode never calls the LLM, and LLM failures fall back to an abstention
   whose text does not contain the raw error.
