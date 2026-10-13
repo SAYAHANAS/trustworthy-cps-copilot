@@ -1,0 +1,40 @@
+# TON_IoT (UNSW Canberra) network dataset. Irregular flow records are shifted to the
+# time they become observable (connection end) and aggregated into right-closed 10 s
+# bins (sum/mean/max of numeric fields, event counts and distinct counts of
+# hosts/ports/services). Outages longer than max_gap_factor bins are dropped and start
+# a new segment. Use the full chronological network CSVs for
+# temporal experiments; the sampled train_test_network.csv is not contiguous in time.
+extends: ../default.yaml
+name: ton-iot-network
+description: TON_IoT network flows aggregated to 10 s windows.
+
+dataset:
+  name: ton_iot
+  paths: [data/raw/TON_IoT/network/train_test_network.csv]
+  timestamp_col: ts
+  timestamp_unit: s
+  event_duration_col: duration   # bin each flow at ts + duration (when it is observable)
+  record_kind: event             # an empty bin means "no traffic", not a lost poll
+  label_col: label
+  positive_labels: [1]
+  attack_type_col: type
+  feature_include: [duration, src_bytes, dst_bytes, missed_bytes, src_pkts, src_ip_bytes,
+                    dst_pkts, dst_ip_bytes, dns_qclass, dns_qtype, dns_rcode,
+                    http_request_body_len, http_response_body_len, http_status_code]
+  count_distinct_cols: [src_ip, dst_ip, dst_port, proto, service, conn_state]
+  resample_seconds: 10
+  resample_aggs: [sum, mean, max]
+  max_gap_factor: 60
+
+split:
+  min_positive_rows: 30
+
+trust:
+  default_criticality: 0.6
+  asset_rules:
+    - {pattern: "^(src|dst)_", asset: iot_network_hosts, criticality: 0.7,
+       description: "IoT/IIoT hosts exchanging traffic on the monitored network"}
+    - {pattern: "^(dns|http)_", asset: network_services, criticality: 0.6,
+       description: "DNS and HTTP services used by IoT gateways"}
+    - {pattern: "^event_count", asset: iot_network_hosts, criticality: 0.7,
+       description: "IoT/IIoT hosts exchanging traffic on the monitored network"}

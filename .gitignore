@@ -1,0 +1,18 @@
+# Experiment outputs are immutable artefacts, not source: archive them separately.
+runs/
+figures/
+llm_cache/
+
+# Raw datasets are licensed by their owners and never committed.
+data/raw/*
+!data/raw/.gitkeep
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/

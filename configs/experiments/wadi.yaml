@@ -1,0 +1,32 @@
+# WADI (Water Distribution, iTrust/SUTD). Use the labelled attack export
+# (e.g. WADI_attackdataLABLE.csv, label column "Attack LABLE (1:No Attack, -1:Attack)").
+# For exports without a label column, provide attack windows instead:
+#   attack_intervals_path: data/raw/WADI/attack_intervals.csv   (columns: start,end[,attack_type])
+extends: ../default.yaml
+name: wadi
+description: WADI attack period, 10 s causal bins, 5/15/30-minute horizons.
+
+dataset:
+  name: wadi
+  paths: [data/raw/WADI/WADI_attackdataLABLE.csv]
+  timestamp_cols: [Date, Time]
+  read_csv_kwargs: {skiprows: 1}
+  resample_seconds: 10
+  resample_aggs: [mean]
+
+split:
+  min_positive_rows: 30
+
+features:
+  windows: [6, 30, 90]
+  stats: [mean, std, min, max]
+
+trust:
+  # WADI tags look like 1_AIT_001_PV, 2_FIT_001_PV ...: first digit = process stage.
+  asset_rules:
+    - {pattern: "^1_", asset: W1_supply, criticality: 0.7,
+       description: "Stage 1 raw water supply and storage"}
+    - {pattern: "^2A?_|^2B_", asset: W2_distribution, criticality: 0.9,
+       description: "Stage 2 elevated reservoir and consumer distribution network"}
+    - {pattern: "^3_", asset: W3_return, criticality: 0.6,
+       description: "Stage 3 return water"}
