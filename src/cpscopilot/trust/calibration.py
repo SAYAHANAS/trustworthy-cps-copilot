@@ -12,6 +12,12 @@ fitting on test would leak). ``fit`` refuses any other split.
   can also correct prior shift caused by class re-weighting).
 * :class:`IsotonicCalibrator` - non-parametric monotone map.
 * :class:`IdentityCalibrator` - no-op baseline.
+
+Calibrators are fitted on the *ensemble-mean* probability. ``memberwise`` says
+whether the same map may also be applied to individual members (needed for the
+uncertainty decomposition): true for smooth monotone parametric maps
+(temperature, Platt, identity), false for isotonic regression, whose plateaus
+would collapse or tear apart member disagreement.
 """
 
 from __future__ import annotations
@@ -59,6 +65,7 @@ def _check_split(split: str, name: str) -> None:
 
 class Calibrator(Protocol):
     name: str
+    memberwise: bool
 
     def fit(self, p: np.ndarray, y: np.ndarray, split: str, ledger: FitLedger,
             component: str) -> Calibrator: ...
@@ -70,6 +77,7 @@ class Calibrator(Protocol):
 
 class _Base:
     name = "base"
+    memberwise = True
 
     def _record(self, ledger: FitLedger, split: str, n: int, component: str) -> None:
         ledger.record(f"calibrator:{component}:{self.name}", split, n)
@@ -179,6 +187,7 @@ class IsotonicCalibrator(_Base):
     """Monotone non-parametric calibration (sklearn ``IsotonicRegression``)."""
 
     name = "isotonic"
+    memberwise = False
 
     def __init__(self) -> None:
         from sklearn.isotonic import IsotonicRegression

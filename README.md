@@ -31,7 +31,7 @@ support. The analyst makes every decision.
 
 ```bash
 pip install -r requirements-lock.txt      # exact tested versions (or: pip install -e ".[dev,llm]")
-make test                                 # 122 tests, ~30 s
+make test                                 # 150 tests, ~1 min
 make smoke                                # one end-to-end run on the synthetic plant
 python scripts/generate_paper_figures.py runs/<run_id> --formats pdf svg pgf
 ```
@@ -58,8 +58,9 @@ PYTHONPATH=src python -m cpscopilot.cli verify runs/<run_id>
 |---|---|---|
 | Shuffled or overlapping splits | contiguous chronological blocks, train → calibration → test, with `embargo_steps` purged rows between them (default: max(feature warm-up + 1, longest horizon)) | `split_audit.json`; `tests/test_splitting.py` |
 | Rolling windows reading the future | trailing windows only (`center=False`, full-window `min_periods`), causal forward-fill, features computed *inside* each split and contiguous segment; warm-up rows dropped | runtime truncation + future-perturbation audit on random rows of every split (`leakage_audit.json`); `tests/test_features_no_leakage.py` |
+| Resampling across outages or before data exist | right-closed bins labelled at their right edge; runs of empty bins longer than `max_gap_factor` periods are dropped (never filled with fake benign rows) so a new segment starts; flow records (e.g. TON_IoT/Zeek) are binned at `ts + duration`, when they become observable (`event_duration_col`) | `fingerprint.resampling` in `data_fingerprint.json`; `tests/test_loaders.py` |
 | Labels crossing the split boundary | future labels use the strictly future in-segment window `(t, t+h]`; rows whose horizon leaves the split are undefined and dropped | brute-force label audit; `tests/test_labels.py` |
-| Statistics fitted on held-out data | imputer, scaler, one-hot vocabulary, models and anomaly scorer refuse to fit on anything but `train`; calibrators only on `calibration`; a fit ledger records every fit | `fit_ledger.json`, audit check `nothing_fitted_on_test`; `tests/test_preprocessing.py` |
+| Statistics fitted on held-out data | imputer, scaler, one-hot vocabulary, models and anomaly scorer refuse to fit on anything but `train`; columns with too little data are dropped based on train coverage only (`features.min_train_coverage`); calibrators only on `calibration`; a fit ledger records every fit | `fit_ledger.json`, audit check `nothing_fitted_on_test`; `tests/test_preprocessing.py` |
 | Label/metadata used as input | metadata columns (`attack_type`, `phase`, …) cannot be features; label-proxy screen on train | `CPSDataset` validation, audit check `no_label_or_meta_features` |
 | Test data tuning thresholds | state thresholds, gate thresholds, alert budget and the epistemic reference are chosen on the calibration split | `trust_state.json`, `gate_thresholds.json` |
 | Ground truth reaching the copilot | evidence packets contain model outputs and sensor deviations only; the retrieval index is built from the knowledge base only | `tests/test_copilot.py::test_packet_never_contains_ground_truth` |
@@ -69,6 +70,11 @@ the run *before* metrics are computed.
 
 ## Reproducibility and data integrity
 
+* **Ensemble diversity** — backends without internal randomness (`hist_gb`, `logistic`,
+  XGBoost without subsampling) automatically use the seeded block bootstrap, and an
+  ensemble whose members predict identically is rejected, so epistemic uncertainty is
+  never rounding noise. Step-function calibrators (isotonic) are not applied member-wise;
+  the decomposition then uses the raw members.
 * **Seeds** — `seed_everything` seeds Python, NumPy and (if installed) PyTorch; every
   estimator receives an explicit seed derived by SHA-256 from the experiment seed and
   its component name. Same seed ⇒ identical metrics and byte-identical prediction
@@ -118,14 +124,18 @@ the run *before* metrics are computed.
   Set `ANTHROPIC_API_KEY` (or log in with `ant auth login`) and run with
   `--set copilot.llm.backend=anthropic`.
 * Guardrails (`enforce_policy`): mode-forbidden content removed, uncited steps dropped,
-  fabricated citations and unknown signal references removed, approval flags forced,
-  autonomous-action phrasing forced to approval, confidence overwritten with the trust
-  layer's value, ungrounded numbers/identifiers flagged. Abstain mode never calls the LLM.
-* Audit (raw and guarded output): citation precision/coverage, signal-reference
-  validity, lexically supported claims, numeric and entity hallucination rates,
-  groundedness. `configs/experiments/synthetic_fault_injection.yaml` injects seeded
-  faults to measure the audit's sensitivity (100 % recall on all four injected fault
-  types in our check, zero false alarms on citation/number/entity checks).
+  fabricated citations and unknown signal references removed, approval forced for steps
+  that cite containment/response/recovery guidance, for analyst profiles and modes that
+  require it, and for autonomous-action phrasing in the action or its rationale;
+  confidence overwritten with the trust layer's value; ungrounded numbers/identifiers
+  flagged. Abstain mode never calls the LLM, and LLM failures fall back to an abstention
+  whose text does not contain the raw error.
+* Audit: citation precision/coverage, signal-reference validity, lexically supported
+  claims, numeric and entity hallucination rates, groundedness. `raw` and `guarded` are
+  computed on the same generated responses, so their difference is the guardrails'
+  effect; abstentions and failed calls are reported separately (`fallbacks`,
+  `guarded_all_events`). `configs/experiments/synthetic_fault_injection.yaml` injects
+  seeded faults to measure the audit's sensitivity.
 
 ## Outputs of one run
 
@@ -166,7 +176,8 @@ Each output directory also holds `figures_manifest.json` and draft `captions.md`
   temporal drift it can *increase* test ECE — the framework reports this rather than
   hiding it (compare `none` vs. `temperature` in `metrics.json`).
 * Claim support is lexical; plug an NLI model into `SupportScorer` for stronger
-  groundedness checks. The template backend is grounded by construction and serves as
+  groundedness checks. Number grounding compares magnitudes (a wrong sign is not
+  detected) and treats percentages only as renderings of fractions in [0, 1]. The template backend is grounded by construction and serves as
   a baseline, not as evidence about LLM behaviour.
 * Asset criticalities and gate thresholds in the configs are illustrative and must be
   set with plant operations.

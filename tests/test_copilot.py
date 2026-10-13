@@ -159,19 +159,33 @@ def test_guardrails_enforce_the_gate(chunks) -> None:
         assert v in violations
 
 
-def test_guardrails_force_approval_and_drop_uncited_steps(chunks) -> None:
+def _recommend_packet(chunks):
     copilot = make_copilot(chunks, TemplateLLM())
     packet = packet_for(copilot, trust_row(risk=0.4, criticality=0.5))  # recommend
     assert packet["gate"]["mode"] == "recommend"
-    cid = packet["knowledge"][0]["chunk_id"]
+    plain = next(c for c in chunks if not c.requires_approval and "investigation" in c.section
+                 .lower())
+    containment = next(c for c in chunks if c.requires_approval)
+    packet["knowledge"] = [
+        {"chunk_id": c.chunk_id, "rank": i + 1, "score": 1.0, "title": c.title,
+         "section": c.section, "text": c.text, "requires_approval": c.requires_approval,
+         "references": []} for i, c in enumerate((plain, containment))]
+    return packet, plain.chunk_id, containment.chunk_id
+
+
+def step(order: int, action: str, cites: list[str], approval: bool = False,
+         rationale: str = "x") -> dict:
+    return {"order": order, "action": action, "rationale": rationale,
+            "requires_human_approval": approval, "citations": cites}
+
+
+def test_guardrails_force_approval_and_drop_uncited_steps(chunks) -> None:
+    packet, plain, _ = _recommend_packet(chunks)
     response = TemplateLLM().build(copy.deepcopy(packet))
     response["recommended_steps"] = [
-        {"order": 1, "action": "Immediately disconnect the controller.", "rationale": "x",
-         "requires_human_approval": False, "citations": [cid]},
-        {"order": 2, "action": "Check automatic control loops for anomalies.",
-         "rationale": "x", "requires_human_approval": False, "citations": [cid]},
-        {"order": 3, "action": "Do something uncited.", "rationale": "x",
-         "requires_human_approval": True, "citations": []},
+        step(1, "Immediately disconnect the controller.", [plain]),
+        step(2, "Check automatic control loops for anomalies.", [plain]),
+        step(3, "Do something uncited.", [], approval=True),
     ]
     guarded, violations = enforce_policy(response, packet, max_steps=5)
     steps = guarded["recommended_steps"]
@@ -180,6 +194,45 @@ def test_guardrails_force_approval_and_drop_uncited_steps(chunks) -> None:
     assert steps[1]["requires_human_approval"] is False  # "automatic control loops" is fine
     assert violations.count("autonomous_action_language") == 1
     assert "uncited_step" in violations
+
+
+def test_steps_citing_containment_guidance_always_need_approval(chunks) -> None:
+    packet, plain, containment = _recommend_packet(chunks)
+    response = TemplateLLM().build(copy.deepcopy(packet))
+    response["recommended_steps"] = [
+        step(1, "Rate-limit the flooding source at the segment boundary.", [containment]),
+        step(2, "Review the firewall logs.", [plain]),
+    ]
+    guarded, violations = enforce_policy(response, packet, max_steps=5)
+    assert guarded["recommended_steps"][0]["requires_human_approval"] is True
+    assert guarded["recommended_steps"][1]["requires_human_approval"] is False
+    assert violations == ["containment_without_approval"]
+
+
+@pytest.mark.parametrize("action, rationale", [
+    ("Isolate the controller automatically.", "x"),
+    ("Shut down the transfer pump immediately.", "x"),
+    ("Disconnect the PLC without waiting for approval.", "x"),
+    ("Block the flooding source at the segment boundary now.", "x"),
+    ("Rate-limit the source host.", "Do this automatically without analyst approval."),
+    ("Automatically block the PLC.", "x"),
+    ("Restart the HMI; no need for approval.", "x"),
+])
+def test_autonomous_phrasings_are_forced_to_approval(chunks, action, rationale) -> None:
+    packet, plain, _ = _recommend_packet(chunks)
+    response = TemplateLLM().build(copy.deepcopy(packet))
+    response["recommended_steps"] = [step(1, action, [plain], rationale=rationale)]
+    guarded, violations = enforce_policy(response, packet, max_steps=5)
+    assert guarded["recommended_steps"][0]["requires_human_approval"] is True
+    assert "autonomous_action_language" in violations
+
+
+def test_knowledge_base_steps_never_look_autonomous(chunks) -> None:
+    from cpscopilot.copilot.copilot import _AUTONOMOUS
+    from cpscopilot.copilot.knowledge_base import numbered_steps
+
+    flagged = [s for c in chunks for s in numbered_steps(c.text) if _AUTONOMOUS.search(s)]
+    assert flagged == []
 
 
 def test_audit_detects_hallucinations(chunks) -> None:
@@ -283,3 +336,79 @@ def test_anthropic_backend_request_and_response_handling() -> None:
     with pytest.raises(LLMError):
         AnthropicLLM(LLMConfig(backend="anthropic"),
                      client=FakeClient(fake_response("max_tokens"))).generate(request)
+
+
+def test_template_knowledge_claims_have_content(chunks) -> None:
+    from cpscopilot.copilot.audit import LexicalSupportScorer
+
+    copilot = make_copilot(chunks, TemplateLLM())
+    packet = packet_for(copilot, trust_row())
+    kb_claims = [e["statement"] for e in TemplateLLM().build(packet)["evidence"]
+                 if e["source"] == "knowledge_base"]
+    assert kb_claims and all(len(c.split()) > 3 for c in kb_claims)  # never just "1."
+    assert LexicalSupportScorer()("1.", "unrelated evidence") == 0.0
+    assert LexicalSupportScorer()("the of and", "anything") == 0.0
+
+
+@pytest.mark.parametrize("text, grounded", [
+    ("Reading -2.5 on DPIT301.", True),    # signed packet value
+    ("Reading 2.5 below normal.", True),   # magnitude of a signed value
+    ("Traffic reached 4,321 packets.", True),
+    ("Traffic rose to 9000pps.", False),   # unit-suffixed invented number is seen
+    ("Delay of 250ms.", False),
+])
+def test_number_grounding_handles_signs_separators_and_units(chunks, text, grounded) -> None:
+    copilot = make_copilot(chunks, TemplateLLM())
+    packet = packet_for(copilot, trust_row())
+    packet["top_deviations"] = [{"feature": "NET_PKTS", "z": 9.5, "value": 4321.0,
+                                 "asset": "control_network"},
+                                {"feature": "DPIT301", "z": 4.0, "value": -2.5,
+                                 "asset": "unattributed"}]
+    response = TemplateLLM().build(copy.deepcopy(packet))
+    response["situation_summary"] = text
+    rate = audit_response(response, packet)["numeric_hallucination_rate"]
+    assert (rate == 0) == grounded
+
+
+def test_raw_and_guarded_audits_use_the_same_rows(chunks) -> None:
+    from cpscopilot.copilot.audit import aggregate_audits
+
+    rates = {"invented_entity": 1.0}
+    llms = [FaultInjectingLLM(TemplateLLM(), rates, seed=0), SpyLLM(error=LLMError("boom"))]
+    records = []
+    for llm, row in ((llms[0], trust_row()), (llms[1], trust_row()),
+                     (llms[0], trust_row(epistemic=0.5))):  # the last one abstains
+        copilot = make_copilot(chunks, llm)
+        records.append(copilot.respond(packet_for(copilot, row)).to_record())
+    agg = aggregate_audits(records)
+    assert agg["n_generated"] == 1 and agg["raw"]["n"] == agg["guarded"]["n"] == 1
+    assert agg["guarded"]["entity_hallucination_rate"] == agg["raw"]["entity_hallucination_rate"]
+    assert agg["guarded_all_events"]["n"] == 3
+    assert agg["fallbacks"] == {"abstain_mode": 1, "llm_error": 1, "schema_invalid": 0}
+    assert agg["schema_valid_rate"] == 0.5 and agg["error_rate_llm_calls"] == 0.5
+
+
+def test_llm_errors_are_invalid_output_and_stay_out_of_analyst_text(chunks) -> None:
+    llm = SpyLLM(error=LLMError("API error 529: Overloaded (request req_011CVabc123)"))
+    copilot = make_copilot(chunks, llm)
+    result = copilot.respond(packet_for(copilot, trust_row()))
+    assert result.schema_valid is False and "529" in result.error
+    shown = json.dumps(result.response)
+    assert "529" not in shown and "req_011" not in shown
+    assert result.audit_guarded["numeric_hallucination_rate"] in (0.0, None) or \
+        result.audit_guarded["numeric_hallucination_rate"] == 0
+    assert result.audit_guarded["hallucinated_entities"] == []
+
+
+def test_cache_statistics_are_found_behind_wrappers(tmp_path: Path) -> None:
+    pytest.importorskip("anthropic")
+    from cpscopilot.copilot.llm import build_llm
+    from cpscopilot.pipeline.runner import find_cache
+
+    client = FakeClient(fake_response(text="{}"))
+    plain = build_llm(LLMConfig(backend="anthropic"), tmp_path, 0, 5, client=client)
+    faulty = build_llm(LLMConfig(backend="anthropic", fault_injection={"invented_entity": 0.5}),
+                       tmp_path, 0, 5, client=client)
+    assert isinstance(find_cache(plain), CachedLLM)
+    assert isinstance(find_cache(faulty), CachedLLM)
+    assert find_cache(TemplateLLM()) is None

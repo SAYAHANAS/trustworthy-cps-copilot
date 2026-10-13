@@ -155,7 +155,11 @@ class TemplateLLM:
                 "source": "prediction", "signal_refs": [f"p_future.{horizon}"], "citations": []})
         if knowledge and mode != "monitor":
             top = knowledge[0]
-            first = re.split(r"(?<=[.!?])\s+", top["text"].strip())[0]
+            items = numbered_steps(top["text"])
+            if items:  # a list section: quote its first item, not the "1." marker
+                first = items[0]
+            else:
+                first = re.split(r"(?<=[.!?])\s+", top["text"].strip())[0]
             evidence.append({"statement": first, "source": "knowledge_base", "signal_refs": [],
                              "citations": [top["chunk_id"]]})
         steps: list[dict[str, Any]] = []

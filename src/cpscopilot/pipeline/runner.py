@@ -39,7 +39,7 @@ from cpscopilot.config import ExperimentConfig
 from cpscopilot.copilot.audit import aggregate_audits
 from cpscopilot.copilot.copilot import CognitiveCopilot
 from cpscopilot.copilot.knowledge_base import kb_fingerprint, load_knowledge_base
-from cpscopilot.copilot.llm import FaultInjectingLLM, build_llm
+from cpscopilot.copilot.llm import CachedLLM, FaultInjectingLLM, build_llm
 from cpscopilot.copilot.retriever import BM25Retriever
 from cpscopilot.data.features import CausalWindowFeaturizer, segment_ids
 from cpscopilot.data.labels import horizon_to_steps, segmentwise_future_labels
@@ -75,7 +75,7 @@ from cpscopilot.utils.logging import close_log_files, get_logger, setup_logging
 from cpscopilot.utils.run_manager import RunContext, create_run
 from cpscopilot.utils.seed import make_rng, seed_everything
 
-__all__ = ["ExperimentRunner", "PreparedSplit", "RunResult", "prepare_split",
+__all__ = ["ExperimentRunner", "PreparedSplit", "RunResult", "find_cache", "prepare_split",
            "select_copilot_events"]
 
 log = get_logger("pipeline.runner")
@@ -109,6 +109,17 @@ class PreparedSplit:
         for y in self.y_future.values():
             mask &= ~np.isnan(y)
         return mask
+
+    def evaluation_mask(self) -> np.ndarray:
+        """Rows usable for operational metrics: every future label defined, or an attack
+        in progress (in ``onset`` mode those rows have undefined future labels by design,
+        but they must still count as ongoing attacks)."""
+        return self.complete_mask() | (self.y_now == 1)
+
+    def future_any(self, keys: list[str], mask: np.ndarray) -> np.ndarray:
+        """Attack within the longest horizon (undefined labels count as 0)."""
+        return np.max(np.vstack([np.nan_to_num(self.y_future[k][mask], nan=0.0)
+                                 for k in keys]), axis=0)
 
 
 @dataclass
@@ -149,6 +160,14 @@ def prepare_split(
         meta=frame.loc[valid, [c for c in meta_cols if c in frame]],
         dropped_warmup=int((~valid).sum()),
     )
+
+
+def find_cache(llm: Any) -> CachedLLM | None:
+    """The response cache inside an LLM wrapper chain (fault injection -> cache -> backend)."""
+    layer = llm
+    while not isinstance(layer, CachedLLM) and hasattr(layer, "inner"):
+        layer = layer.inner
+    return layer if isinstance(layer, CachedLLM) else None
 
 
 def select_copilot_events(trust: pd.DataFrame, modes: np.ndarray, max_events: int,
@@ -209,7 +228,16 @@ class ExperimentRunner:
                    embargo_steps=embargo, gaps_seconds=split_audit["boundary_gaps_seconds"])
 
         frames = dict(split.frames)
-        base_cols = list(dataset.feature_cols)
+        # Column usability is decided on the training split only.
+        coverage = frames["train"][dataset.feature_cols].notna().mean()
+        low_coverage = [c for c in dataset.feature_cols
+                        if coverage[c] < cfg.features.min_train_coverage]
+        if low_coverage:
+            log.warning("dropping %d columns with train coverage < %.2f: %s", len(low_coverage),
+                        cfg.features.min_train_coverage, low_coverage[:10])
+        base_cols = [c for c in dataset.feature_cols if c not in set(low_coverage)]
+        if not base_cols:
+            raise ValueError("no input column has enough non-missing values in the train split")
         if dataset.categorical_cols:
             encoder = TrainOnlyOneHotEncoder(dataset.categorical_cols).fit(
                 frames["train"], "train", ledger)
@@ -245,6 +273,7 @@ class ExperimentRunner:
                        dropped_warmup=part.dropped_warmup, n_attack_rows=int(part.y_now.sum()))
         info = {"embargo_steps": embargo, "horizon_steps": horizon_steps,
                 "warmup_steps": featurizer.warmup_steps, "base_columns": base_cols,
+                "dropped_low_train_coverage": low_coverage,
                 "n_window_features": prepared["train"].X.shape[1]}
         return prepared, base_cols, horizon_steps, info
 
@@ -309,9 +338,9 @@ class ExperimentRunner:
     def _evaluate_trust_and_gate(self, trust: TrustRiskLayer, trust_test: pd.DataFrame,
                                  decisions: dict[str, pd.DataFrame], te: PreparedSplit,
                                  sampling_seconds: float) -> dict[str, Any]:
-        mask = te.complete_mask()
+        mask = te.evaluation_mask()
         y_now = te.y_now[mask]
-        y_any = np.max(np.vstack([te.y_future[k][mask] for k in trust.horizon_keys]), axis=0)
+        y_any = te.future_any(trust.horizon_keys, mask)
         frame = trust_test[mask]
         assert trust.thresholds_ is not None
         decision = (frame["p_detect"].to_numpy() >= trust.thresholds_["malicious"]).astype(int)
@@ -325,24 +354,32 @@ class ExperimentRunner:
         p_cal = frame["p_detect"].to_numpy()
         conf_raw = np.where(decision == 1, p_raw, 1 - p_raw)
         conf_cal = np.where(decision == 1, p_cal, 1 - p_cal)
-        assert trust.epistemic_reference_ is not None
-        epi_rel = np.clip(frame["epi_detection"].to_numpy() / trust.epistemic_reference_, 0, 1)
+        assert trust.epistemic_reference_detection_ is not None
+        epi_det = frame["epi_detection"].to_numpy()
+        epi_rel = np.clip(epi_det / trust.epistemic_reference_detection_, 0, 1)
         conf_trust = conf_cal * (1 - epi_rel) * frame["cross_source"].to_numpy()
         selective = {
             "raw_probability": risk_coverage(errors, conf_raw),
             "calibrated_probability": risk_coverage(errors, conf_cal),
             "trust_adjusted": risk_coverage(errors, conf_trust),
         }
+        err = errors.astype(int)
         uncertainty = {
+            # Uncertainty of the detection ensemble itself vs. its own decision errors.
             "error_detection_auroc": {
-                "epistemic": roc_auc(errors.astype(int), frame["epistemic"].to_numpy()),
-                "aleatoric": roc_auc(errors.astype(int), frame["aleatoric"].to_numpy()),
-                "one_minus_trust_adjusted_confidence": roc_auc(errors.astype(int),
-                                                               1 - conf_trust),
-                "inconsistency": roc_auc(errors.astype(int), 1 - frame["consistency"].to_numpy()),
+                "epistemic": roc_auc(err, epi_det),
+                "aleatoric": roc_auc(err, frame["alea_detection"].to_numpy()),
+                "one_minus_trust_adjusted_confidence": roc_auc(err, 1 - conf_trust),
+                "inconsistency": roc_auc(err, 1 - frame["cross_source"].to_numpy()),
             },
-            "mean_epistemic_correct": float(frame["epistemic"][~errors].mean()),
-            "mean_epistemic_error": float(frame["epistemic"][errors].mean())
+            # Gate-level signals (max over all models / risk driver), reported separately.
+            "error_detection_auroc_gate_signals": {
+                "epistemic_max_over_models": roc_auc(err, frame["epistemic"].to_numpy()),
+                "aleatoric_risk_driver": roc_auc(err, frame["aleatoric"].to_numpy()),
+                "inconsistency_combined": roc_auc(err, 1 - frame["consistency"].to_numpy()),
+            },
+            "mean_epistemic_detection_correct": float(epi_det[~errors].mean()),
+            "mean_epistemic_detection_error": float(epi_det[errors].mean())
             if errors.any() else None,
             "decision_error_rate": float(errors.mean()),
         }
@@ -392,10 +429,9 @@ class ExperimentRunner:
         if isinstance(llm, FaultInjectingLLM):
             audit["fault_injection"] = {"rates": cfg.copilot.llm.fault_injection,
                                         "injected": llm.injected}
-        cache_stats = getattr(getattr(llm, "inner", llm), "hits", None)
-        if cache_stats is not None:
-            inner = getattr(llm, "inner", llm)
-            audit["llm_cache"] = {"hits": inner.hits, "misses": inner.misses}
+        cache_layer = find_cache(llm)
+        if cache_layer is not None:
+            audit["llm_cache"] = {"hits": cache_layer.hits, "misses": cache_layer.misses}
         ctx.save_json("copilot_audit.json", audit)
         return audit
 
@@ -481,10 +517,9 @@ class ExperimentRunner:
         lap("trust")
 
         # Stage 5 - assistance gate (alert budget resolved on calibration benign rows)
-        cal_complete = cal.complete_mask()
-        cal_future_any = np.max(np.vstack([np.nan_to_num(y, nan=1.0)
-                                           for y in cal.y_future.values()]), axis=0)
-        benign_cal = cal_complete & (cal.y_now == 0) & (cal_future_any == 0)
+        # Benign = complete labels, no attack now and none within the longest horizon.
+        cal_future_any = cal.future_any(list(cal.y_future), np.ones(cal.n, dtype=bool))
+        benign_cal = cal.complete_mask() & (cal.y_now == 0) & (cal_future_any == 0)
         gate = AssistanceGate(cfg.gate).fit(trust_cal, benign_cal)
         decisions = {p.analyst_id: gate.decide_batch(trust_test, p)
                      for p in cfg.gate.analyst_profiles}
@@ -573,6 +608,7 @@ class ExperimentRunner:
             "models": model_metrics,
             "trust": {"state_thresholds": trust.thresholds_,
                       "epistemic_reference": trust.epistemic_reference_,
+                      "epistemic_reference_detection": trust.epistemic_reference_detection_,
                       "temperatures": {k: v["temperature"].state_dict().get("temperature")
                                        for k, v in trust.calibrators.items()
                                        if "temperature" in v}},

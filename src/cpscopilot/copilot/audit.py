@@ -31,7 +31,13 @@ from cpscopilot.copilot.retriever import tokenize
 __all__ = ["LexicalSupportScorer", "SupportScorer", "aggregate_audits", "audit_response",
            "extract_entities", "extract_numbers", "ungrounded_spans"]
 
-_NUMBER = re.compile(r"(?<![A-Za-z0-9_.])(\d+(?:\.\d+)?)(%?)(?![A-Za-z0-9_])(?!\.\d)")
+# A standalone number: optional sign, optional thousands separators, optional
+# percent sign or short unit suffix ("250ms", "9000pps", "3x"); never part of an
+# identifier such as FIT101, T0856 or 1_AIT_001_PV.
+_NUMBER = re.compile(
+    r"(?<![A-Za-z0-9_.,])(-?)(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(%?)"
+    r"(?:[A-Za-z]{1,4})?(?![A-Za-z0-9_])(?!\.\d)(?!,\d{3})"
+)
 _ENTITY = re.compile(r"\b(?:[A-Za-z][A-Za-z0-9_]*\d[A-Za-z0-9_]*|[A-Z][A-Z0-9]*_[A-Za-z0-9_]+)\b")
 _TRIVIAL_INTEGERS = set(range(0, 11))
 
@@ -46,17 +52,18 @@ class LexicalSupportScorer:
     def __call__(self, claim: str, evidence: str) -> float:
         claim_tokens = set(tokenize(claim))
         if not claim_tokens:
-            return 1.0
+            return 0.0  # a claim with no content cannot be "supported"
         return len(claim_tokens & set(tokenize(evidence))) / len(claim_tokens)
 
 
 def extract_numbers(text: str) -> list[tuple[float, int, bool]]:
-    """``(value, decimals, is_percent)`` for each standalone number."""
+    """``(signed value, decimals, is_percent)`` for each standalone number."""
     out = []
     for m in _NUMBER.finditer(text):
-        raw = m.group(1)
-        decimals = len(raw.split(".")[1]) if "." in raw else 0
-        out.append((float(raw), decimals, m.group(2) == "%"))
+        digits = m.group(2).replace(",", "")
+        decimals = len(digits.split(".")[1]) if "." in digits else 0
+        value = float(digits) * (-1.0 if m.group(1) == "-" else 1.0)
+        out.append((value, decimals, m.group(3) == "%"))
     return out
 
 
@@ -81,10 +88,18 @@ def _packet_numbers(obj: Any, acc: list[float]) -> None:
 
 
 def _number_grounded(value: float, decimals: int, allowed: np.ndarray) -> bool:
+    """Grounded if a packet number matches up to rounding or as a percentage.
+
+    Magnitudes are compared, so "dropped by 2.5" for a packet value of -2.5 is
+    grounded (a wrong sign is not detected).
+    """
+    value = abs(value)
     if decimals == 0 and value in _TRIVIAL_INTEGERS:
         return True
+    allowed = np.abs(allowed)
     plain = np.abs(np.round(allowed, decimals) - value) < 1e-9
-    pct = np.abs(np.round(100 * allowed, decimals) - value) < 1e-9
+    fractions = allowed[allowed <= 1.0]  # only probabilities/rates may appear as percentages
+    pct = np.abs(np.round(100 * fractions, decimals) - value) < 1e-9
     return bool(plain.any() or pct.any())
 
 
@@ -202,8 +217,14 @@ _MEAN_KEYS = ("citation_precision", "citation_coverage", "signal_ref_validity",
 
 
 def aggregate_audits(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate per-response audits (``records`` hold ``mode``, ``raw``, ``guarded``,
-    ``violations`` and ``schema_valid``)."""
+    """Aggregate per-response audits.
+
+    ``raw`` and ``guarded`` are computed on the *same* rows - the responses the LLM
+    actually produced (schema-valid) - so their difference measures the guardrails
+    alone. Fallback abstentions (abstain mode, LLM errors, invalid output) are
+    trivially grounded; they are counted separately and only enter
+    ``guarded_all_events``.
+    """
 
     def summarise(rows: list[dict[str, Any]], which: str) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -218,23 +239,33 @@ def aggregate_audits(records: list[dict[str, Any]]) -> dict[str, Any]:
         return out
 
     llm_rows = [r for r in records if r.get("llm_called")]
+    generated = [r for r in records if r.get("raw")]  # LLM output that passed validation
     violations: dict[str, int] = {}
     for r in records:
         for v in r.get("violations", []):
             violations[v] = violations.get(v, 0) + 1
     by_mode: dict[str, Any] = {}
     for mode in sorted({r["mode"] for r in records}):
-        rows = [r for r in records if r["mode"] == mode]
-        by_mode[mode] = {"n": len(rows), "raw": summarise(rows, "raw"),
-                         "guarded": summarise(rows, "guarded")}
+        rows = [r for r in generated if r["mode"] == mode]
+        by_mode[mode] = {"n_events": sum(r["mode"] == mode for r in records),
+                         "raw": summarise(rows, "raw"), "guarded": summarise(rows, "guarded")}
     return {
         "n_events": len(records),
         "n_llm_calls": len(llm_rows),
-        "schema_valid_rate": float(np.mean([r["schema_valid"] for r in llm_rows]))
+        "n_generated": len(generated),
+        "schema_valid_rate": float(np.mean([bool(r["schema_valid"]) for r in llm_rows]))
         if llm_rows else None,
-        "error_rate": float(np.mean([bool(r.get("error")) for r in records])) if records else None,
-        "raw": summarise(records, "raw"),
-        "guarded": summarise(records, "guarded"),
+        "error_rate_llm_calls": float(np.mean([bool(r.get("error")) for r in llm_rows]))
+        if llm_rows else None,
+        "fallbacks": {
+            "abstain_mode": sum(r["mode"] == "abstain" and not r.get("llm_called")
+                                for r in records),
+            "llm_error": sum("llm_error" in r.get("violations", []) for r in records),
+            "schema_invalid": sum("schema_invalid" in r.get("violations", []) for r in records),
+        },
+        "raw": summarise(generated, "raw"),
+        "guarded": summarise(generated, "guarded"),
+        "guarded_all_events": summarise(records, "guarded"),
         "policy_violations": dict(sorted(violations.items())),
         "events_with_violations": int(sum(bool(r.get("violations")) for r in records)),
         "by_mode": by_mode,

@@ -140,3 +140,60 @@ def test_alert_budget_raises_thresholds_on_calibration_benign_rows() -> None:
     assert np.mean(cal["risk"] >= t.explain_min_risk) == pytest.approx(0.1, abs=0.005)
     assert np.mean(cal["risk"] >= t.recommend_min_risk) == pytest.approx(0.02, abs=0.005)
     assert t.explain_min_risk <= t.recommend_min_risk <= t.approval_min_risk
+
+
+def test_deterministic_backends_still_get_diverse_members() -> None:
+    from cpscopilot.config import ModelConfig
+    from cpscopilot.models.ensemble import ProbabilisticEnsemble
+
+    rng = np.random.default_rng(5)
+    X = rng.normal(size=(1500, 6))
+    y = (X[:, 0] + 0.5 * rng.normal(size=1500) > 1.0).astype(int)
+    for cfg in (ModelConfig(backend="hist_gb", ensemble_size=3, block_size=50,
+                            params={"n_estimators": 20, "max_depth": 3}),
+                ModelConfig(backend="xgboost", ensemble_size=3, block_size=50,
+                            params={"n_estimators": 20, "max_depth": 3, "subsample": 1.0,
+                                    "colsample_bytree": 1.0})):
+        ens = ProbabilisticEnsemble("m", cfg, 0).fit(X, y, "train", FitLedger())
+        assert ens.train_info["effective_bootstrap"] == "block"
+        assert np.ptp(ens.predict_member_proba(X), axis=0).max() > 1e-6
+    # a single block covering every row is a permutation: members stay identical -> refused
+    same = ModelConfig(backend="logistic", ensemble_size=3, bootstrap="block", block_size=1500)
+    with pytest.raises(ValueError, match="identically"):
+        ProbabilisticEnsemble("m", same, 0).fit(X, y, "train", FitLedger())
+
+
+def test_identical_members_have_exactly_zero_epistemic() -> None:
+    p = np.array([0.1, 0.37, 0.5, 0.83, 0.99])
+    parts = decompose_uncertainty(np.vstack([p, p, p]))
+    assert np.all(parts["epistemic"] == 0.0)
+
+
+def test_step_function_calibrators_are_not_applied_member_wise() -> None:
+    from cpscopilot.config import CalibrationConfig, TrustConfig
+    from cpscopilot.trust.calibration import make_calibrator
+    from cpscopilot.trust.risk import TrustRiskLayer
+
+    rng = np.random.default_rng(6)
+    p = rng.random(2000)
+    y = (rng.random(2000) < p).astype(int)
+    layer = TrustRiskLayer(TrustConfig(), CalibrationConfig(method="isotonic"), {},
+                           AssetRegistry([], 0.5), RobustAnomalyScorer(), [])
+    iso = make_calibrator("isotonic").fit(p, y, "calibration", FitLedger(), "detection")
+    temp = make_calibrator("temperature").fit(p, y, "calibration", FitLedger(), "detection")
+    layer.calibrators = {"detection": {"isotonic": iso, "temperature": temp}}
+    members = np.vstack([p, np.clip(p + 0.05, 0, 1), np.clip(p - 0.05, 0, 1)])
+    mean_iso, for_unc = layer.calibrate("detection", members, "isotonic")
+    np.testing.assert_array_equal(for_unc, members)  # raw members keep their disagreement
+    np.testing.assert_allclose(mean_iso, iso.transform(members.mean(axis=0)))
+    _, mapped = layer.calibrate("detection", members, "temperature")
+    np.testing.assert_allclose(mapped, temp.transform(members))  # smooth maps stay member-wise
+
+
+def test_alert_budget_holds_with_tied_risks() -> None:
+    risk = np.r_[np.zeros(800), np.full(90, 0.12063), np.linspace(0.13, 1.0, 110)]
+    cal = pd.DataFrame({"epistemic": np.zeros(1000), "risk": risk})
+    gate = AssistanceGate(GateConfig(explain_benign_budget=0.10,
+                                     recommend_benign_budget=0.02)).fit(cal, np.ones(1000, bool))
+    assert np.mean(risk >= gate.base_.explain_min_risk) <= 0.10
+    assert np.mean(risk >= gate.base_.recommend_min_risk) <= 0.02

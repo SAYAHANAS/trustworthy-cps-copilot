@@ -23,7 +23,8 @@ from cpscopilot.data.leakage import FitLedger, LeakageError, index_fingerprint
 from cpscopilot.utils.logging import get_logger
 from cpscopilot.utils.seed import derive_seed
 
-__all__ = ["ProbabilisticEnsemble", "build_estimator", "moving_block_indices"]
+__all__ = ["ProbabilisticEnsemble", "build_estimator", "has_internal_randomness",
+           "moving_block_indices"]
 
 log = get_logger("models.ensemble")
 
@@ -91,8 +92,28 @@ def build_estimator(cfg: ModelConfig, seed: int, n_jobs: int, pos_weight: float)
     raise ValueError(f"unknown backend {cfg.backend!r}")
 
 
+def has_internal_randomness(cfg: ModelConfig) -> bool:
+    """Whether differently seeded members of this backend differ without resampling.
+
+    ``hist_gb`` (no early stopping, < 200k rows) and ``logistic`` are deterministic,
+    and so is XGBoost without row/column subsampling; seeds alone would then give
+    identical members and a meaningless (zero) epistemic uncertainty.
+    """
+    if cfg.backend in ("hist_gb", "logistic"):
+        return False
+    if cfg.backend == "xgboost":
+        p = cfg.params
+        return float(p.get("subsample", 1.0)) < 1.0 or float(p.get("colsample_bytree", 1.0)) < 1.0
+    return True  # random_forest bootstraps rows internally
+
+
 class ProbabilisticEnsemble:
-    """``M`` seeded members; exposes per-member and mean positive-class probabilities."""
+    """``M`` seeded members; exposes per-member and mean positive-class probabilities.
+
+    Member diversity is guaranteed: for backends without internal randomness the
+    seeded moving-block bootstrap is used even when ``bootstrap: none``, and an
+    ensemble whose members still predict identically is rejected.
+    """
 
     def __init__(self, name: str, cfg: ModelConfig, base_seed: int, n_jobs: int = 1) -> None:
         self.name = name
@@ -114,11 +135,17 @@ class ProbabilisticEnsemble:
             raise ValueError(f"{self.name}: training labels contain a single class {classes}")
         self.members, self.member_seeds = [], []
         n = len(y)
+        bootstrap = self.cfg.bootstrap
+        if self.cfg.ensemble_size > 1 and bootstrap == "none" and not has_internal_randomness(
+                self.cfg):
+            bootstrap = "block"
+            log.warning("%s: backend %r has no internal randomness; using the seeded block "
+                        "bootstrap so that ensemble members differ", self.name, self.cfg.backend)
         for m in range(self.cfg.ensemble_size):
             seed = derive_seed(self.base_seed, self.name, "member", m)
             rng = np.random.default_rng(seed)
             idx = np.arange(n)
-            if self.cfg.bootstrap == "block":
+            if bootstrap == "block":
                 for _attempt in range(10):
                     cand = moving_block_indices(n, self.cfg.block_size, rng)
                     if len(np.unique(y[cand])) == 2:
@@ -139,9 +166,17 @@ class ProbabilisticEnsemble:
                 est.fit(Xm, ym, sample_weight=weights)
             self.members.append(est)
             self.member_seeds.append(seed)
+        if self.cfg.ensemble_size > 1:
+            probe = self.predict_member_proba(X[: min(n, 5000)])
+            if float(np.ptp(probe, axis=0).max()) < 1e-12:
+                raise ValueError(
+                    f"{self.name}: all {self.cfg.ensemble_size} ensemble members predict "
+                    "identically, so epistemic uncertainty is undefined; use bootstrap: block "
+                    "or a stochastic backend configuration")
         prevalence = float(y.mean())
         self.train_info = {"n_rows": n, "prevalence": prevalence,
-                           "member_seeds": self.member_seeds, "backend": self.cfg.backend}
+                           "member_seeds": self.member_seeds, "backend": self.cfg.backend,
+                           "effective_bootstrap": bootstrap}
         ledger.record(f"model:{self.name}", split, n,
                       index_fingerprint(row_ids) if row_ids is not None else None,
                       prevalence=prevalence, members=len(self.members))

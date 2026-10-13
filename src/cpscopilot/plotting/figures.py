@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,7 @@ import matplotlib.pyplot as plt  # backend is fixed to Agg by plotting.style
 import numpy as np
 import pandas as pd
 
+from cpscopilot.pipeline.aggregate import check_independent_runs
 from cpscopilot.plotting.style import (
     COLUMN_WIDTH,
     GATE_COLORS,
@@ -129,8 +131,40 @@ def short_label(key: str) -> str:
 
 
 # ------------------------------------------------------------------ figures
+def _pooled_reliability(runs: list[RunArtifacts], key: str, method: str) -> dict[str, np.ndarray]:
+    """Pool reliability bins across runs (bins share edges): summed counts and
+    count-weighted mean confidence / observed frequency per bin."""
+    first = runs[0].reliability[key][method]
+    lower, upper = np.array(first["lower"], dtype=float), np.array(first["upper"], dtype=float)
+    count = np.zeros(len(lower))
+    conf_sum = np.zeros(len(lower))
+    freq_sum = np.zeros(len(lower))
+    for r in runs:
+        rel = r.reliability[key][method]
+        c = np.array(rel["count"], dtype=float)
+        count += c
+        conf_sum += np.nan_to_num(np.array(rel["confidence"], dtype=float)) * c
+        freq_sum += np.nan_to_num(np.array(rel["frequency"], dtype=float)) * c
+    with np.errstate(invalid="ignore", divide="ignore"):
+        conf = np.where(count > 0, conf_sum / count, np.nan)
+        freq = np.where(count > 0, freq_sum / count, np.nan)
+    ece = float(np.nansum(count * np.abs(freq - conf)) / count.sum()) if count.sum() else np.nan
+    return {"lower": lower, "upper": upper, "count": count, "confidence": conf,
+            "frequency": freq, "ece": ece}
+
+
+def _shared_methods(runs: list[RunArtifacts], key: str, primary: str) -> list[str]:
+    return [m for m in dict.fromkeys(("none", primary))
+            if all(m in r.reliability.get(key, {}) for r in runs)]
+
+
 def fig_reliability(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
-    """Reliability diagrams before/after calibration, one column per model."""
+    """Reliability diagrams before/after calibration, one column per model.
+
+    Curves and histograms pool the bins of all runs; the in-panel ECE is the ECE
+    of the plotted (pooled) curve, and the caption gives the mean +/- s.d. of the
+    per-run ECEs.
+    """
     run = runs[0]
     keys = run.model_keys
     primary = run.primary_method
@@ -141,31 +175,30 @@ def fig_reliability(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
         ax = fig.add_subplot(grid[0, j])
         hist = fig.add_subplot(grid[1, j], sharex=ax)
         ax.plot([0, 1], [0, 1], color=INK["muted"], linewidth=0.7, zorder=1)
-        ece_text, ece_cap = [], []
-        for method in ("none", primary):
-            rel = run.reliability[key][method]
-            conf = np.array(rel["confidence"], dtype=float)
-            freq = np.array(rel["frequency"], dtype=float)
-            count = np.array(rel["count"], dtype=float)
-            ok = count > 0
-            ax.plot(conf[ok], freq[ok], color=METHOD_COLORS[method], marker="o",
-                    label=METHOD_LABELS[method], zorder=3 if method == primary else 2)
-            stats_ = _mean_std([r.metrics["models"][key][method]["calibration"]["ece"]
-                                for r in runs])
-            ece_text.append(_fmt(*stats_))
-            ece_cap.append(_cap(*stats_))
-        caption_parts.append(f"{model_label(key)}: ECE {ece_cap[0]} to {ece_cap[1]}")
-        rel = run.reliability[key][primary]
-        lower, upper = np.array(rel["lower"]), np.array(rel["upper"])
-        hist.bar(lower, np.array(rel["count"], dtype=float), width=upper - lower, align="edge",
-                 color=INK["neutral"], edgecolor=INK["surface"], linewidth=0.6)
+        methods = _shared_methods(runs, key, primary)
+        notes, caps = [], []
+        for method in methods:
+            pooled = _pooled_reliability(runs, key, method)
+            ok = pooled["count"] > 0
+            ax.plot(pooled["confidence"][ok], pooled["frequency"][ok],
+                    color=METHOD_COLORS.get(method, INK["secondary"]), marker="o",
+                    label=METHOD_LABELS.get(method, method),
+                    zorder=3 if method == primary else 2)
+            short = "uncal." if method == "none" else "calib."
+            notes.append(f"ECE {short} {pooled['ece']:.3f}")
+            per_run = _mean_std([r.metrics["models"][key][method]["calibration"]["ece"]
+                                 for r in runs])
+            caps.append(f"{METHOD_LABELS.get(method, method).lower()} {_cap(*per_run)}")
+        caption_parts.append(f"{model_label(key)}: per-run ECE " + ", ".join(caps))
+        pooled = _pooled_reliability(runs, key, methods[-1])
+        hist.bar(pooled["lower"], pooled["count"], width=pooled["upper"] - pooled["lower"],
+                 align="edge", color=INK["neutral"], edgecolor=INK["surface"], linewidth=0.6)
         hist.set_yscale("log")
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         ax.set_title(model_label(key))
-        ax.text(0.97, 0.04, f"ECE uncal. {ece_text[0]}\nECE calib. {ece_text[1]}",
-                transform=ax.transAxes, ha="right", va="bottom", fontsize=5.8,
-                color=INK["secondary"], linespacing=1.3, zorder=5,
+        ax.text(0.97, 0.04, "\n".join(notes), transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=5.8, color=INK["secondary"], linespacing=1.3, zorder=5,
                 bbox={"boxstyle": "round,pad=0.25", "facecolor": INK["surface"],
                       "edgecolor": INK["grid"], "linewidth": 0.5, "alpha": 0.9})
         ax.tick_params(labelbottom=False)
@@ -177,9 +210,10 @@ def fig_reliability(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
     handles, labels = fig.axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.12))
     caption = (f"Reliability diagrams on the test split before and after "
-               f"{METHOD_LABELS[primary].lower()} fitted on the calibration split "
-               f"({len(runs)} run(s)); bottom: samples per bin (log scale). "
-               + "; ".join(caption_parts) + ".")
+               f"{METHOD_LABELS[primary].lower()} fitted on the calibration split. Curves and "
+               f"histograms pool the bins of {len(runs)} run(s) and the in-panel ECE is that of "
+               "the pooled curve; bottom: samples per bin (log scale). "
+               + "; ".join(caption_parts) + " (mean ± s.d. over runs).")
     return fig, caption
 
 
@@ -198,7 +232,7 @@ def _mean_curve(runs: list[RunArtifacts], key: str, method: str, kind: str) -> t
     if not ys:
         return None, None, None
     y = np.vstack(ys)
-    return xs[0], y.mean(axis=0), y.std(axis=0) if len(ys) > 1 else None
+    return xs[0], y.mean(axis=0), y.std(axis=0, ddof=1) if len(ys) > 1 else None
 
 
 def fig_roc_pr(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
@@ -374,19 +408,28 @@ def fig_risk_coverage(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
     return fig, caption
 
 
-def fig_uncertainty(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
-    """Epistemic uncertainty of correct vs. erroneous detection decisions (ECDF)."""
-    run = runs[0]
+def _decision_rows(run: RunArtifacts) -> pd.DataFrame:
+    """Test rows used for operational metrics (same mask as the runner) with the
+    detection decision error of each row."""
     df = run.predictions
     ycols = [c for c in df.columns if c.startswith("y_h")]
-    df = df.dropna(subset=ycols)
+    keep = df[ycols].notna().all(axis=1) | (df["y_now"] == 1)
+    df = df.loc[keep]
     tau = run.metrics["trust"]["state_thresholds"]["malicious"]
-    errors = (df["p_detect"] >= tau).astype(int) != df["y_now"]
+    return df.assign(error=((df["p_detect"] >= tau).astype(int) != df["y_now"]))
+
+
+def fig_uncertainty(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
+    """Detection-ensemble epistemic uncertainty of correct vs. erroneous detection
+    decisions (ECDF over the rows of all runs)."""
+    df = pd.concat([_decision_rows(r) for r in runs], ignore_index=True)
+    errors = df["error"].to_numpy(dtype=bool)
     fig, ax = plt.subplots(figsize=(COLUMN_WIDTH, 2.2))
+    floor = 1e-6
     for mask, label, color, marker in ((~errors, "Correct decisions", METHOD_COLORS["temperature"],
                                         "o"), (errors, "Erroneous decisions", MODEL_COLORS["h5"],
                                                "s")):
-        values = np.sort(np.clip(df.loc[mask, "epistemic"].to_numpy(), 1e-6, None))
+        values = np.sort(np.clip(df.loc[mask, "epi_detection"].to_numpy(), floor, None))
         if len(values) == 0:
             continue
         ecdf = np.arange(1, len(values) + 1) / len(values)
@@ -396,14 +439,16 @@ def fig_uncertainty(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
     auroc = _mean_std([r.metrics["operational"]["uncertainty"]["error_detection_auroc"]
                        ["epistemic"] for r in runs])
     ax.set_xscale("log")
-    ax.set_xlabel("Epistemic uncertainty (mutual information, bits)")
+    ax.set_xlabel("Detection-ensemble epistemic uncertainty (bits)")
     ax.set_ylabel("Cumulative fraction")
     ax.set_ylim(0, 1.02)
     ax.legend(loc="upper left", fontsize=6)
     fig.tight_layout()
-    caption = ("Empirical CDF of ensemble epistemic uncertainty for correct and erroneous "
-               f"detection decisions on the test split; error-detection AUROC of epistemic "
-               f"uncertainty {_cap(*auroc)}.")
+    caption = ("Empirical CDF of the detection ensemble's epistemic uncertainty (mutual "
+               "information) for correct and erroneous detection decisions on the test split, "
+               f"pooled over {len(runs)} run(s); values below {floor:g} bits are drawn at "
+               f"{floor:g}. Error-detection AUROC of this uncertainty {_cap(*auroc)} "
+               "(mean ± s.d. over runs).")
     return fig, caption
 
 
@@ -423,24 +468,31 @@ def fig_horizon(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
     def cls(r: RunArtifacts, k: str, field: str) -> float:
         return r.metrics["models"][k][primary]["classification"][field]
 
-    def proactive(r: RunArtifacts, k: str) -> float | None:
-        sub = r.metrics["models"][k][primary].get("proactive_subset")
-        return sub["classification"]["pr_auc"] if sub else None
+    def proactive(field: str) -> Callable[[RunArtifacts, str], float | None]:
+        def get(r: RunArtifacts, k: str) -> float | None:
+            sub = r.metrics["models"][k][primary].get("proactive_subset")
+            return sub["classification"][field] if sub else None
+        return get
 
-    for (m, s), label, color, marker in (
-        (series(lambda r, k: cls(r, k, "pr_auc")), "All test rows", METHOD_COLORS["temperature"],
-         "o"),
-        (series(proactive), "No attack in progress", MODEL_COLORS["h5"], "s"),
-        (series(lambda r, k: cls(r, k, "prevalence")), "No-skill (prevalence)", INK["neutral"],
-         "D"),
+    # Each PR-AUC series is drawn with its own no-skill level (its prevalence).
+    blue, orange = METHOD_COLORS["temperature"], MODEL_COLORS["h5"]
+    for (m, s), label, color, marker, hollow in (
+        (series(lambda r, k: cls(r, k, "pr_auc")), "All test rows", blue, "o", False),
+        (series(lambda r, k: cls(r, k, "prevalence")), "No-skill, all test rows", blue, "o", True),
+        (series(proactive("pr_auc")), "No attack in progress", orange, "s", False),
+        (series(proactive("prevalence")), "No-skill, no attack in progress", orange, "s", True),
     ):
         ok = np.isfinite(m)
         axes[0].errorbar(x[ok], m[ok], yerr=s[ok] if len(runs) > 1 else None, color=color,
-                         marker=marker, label=label, capsize=1.5, elinewidth=0.6)
+                         marker=marker, label=label, capsize=1.5, elinewidth=0.6,
+                         linewidth=0.8 if hollow else 1.4,
+                         markerfacecolor=INK["surface"] if hollow else color)
     axes[0].set_ylabel("PR-AUC")
     axes[0].set_ylim(0, 1.02)
     axes[0].set_title("(a) Discrimination", loc="left")
-    for method in ("none", primary):
+    methods = [mm for mm in dict.fromkeys(("none", primary))
+               if all(mm in r.metrics["models"][k] for r in runs for k in keys)]
+    for method in methods:
         m, s = series(lambda r, k, mm=method: r.metrics["models"][k][mm]["calibration"]["ece"])
         axes[1].errorbar(x, m, yerr=s if len(runs) > 1 else None, color=METHOD_COLORS[method],
                          marker="o", label=METHOD_LABELS[method], capsize=1.5, elinewidth=0.6)
@@ -452,9 +504,10 @@ def fig_horizon(runs: list[RunArtifacts]) -> tuple[plt.Figure, str]:
         ax.set_xlabel("Horizon (minutes)")
         ax.legend(loc="upper left", bbox_to_anchor=(0.0, -0.3), ncol=1, fontsize=6)
     fig.tight_layout(w_pad=2.5)
-    caption = ("Performance versus prediction horizon. Left: PR-AUC on all test rows, on rows "
-               "with no attack in progress (truly proactive prediction) and the no-skill "
-               "baseline. Right: ECE before and after calibration.")
+    caption = ("Performance versus prediction horizon. Left: PR-AUC on all test rows and on rows "
+               "with no attack in progress (truly proactive prediction), each with its own "
+               "no-skill level (its prevalence, hollow markers). Right: ECE before and after "
+               "calibration.")
     return fig, caption
 
 
@@ -514,8 +567,13 @@ def fig_groundedness(runs: list[RunArtifacts]) -> tuple[plt.Figure, str] | None:
                bbox_to_anchor=(0.5, 1.08))
     a0 = audits[0]
     backend = a0.get("backend", "?")
-    caption = (f"Copilot audit ({backend} backend, {a0['n_events']} events per run, "
-               f"{a0['n_llm_calls']} generations). Raw groundedness "
+    fallbacks = a0.get("fallbacks", {})
+    caption = (f"Copilot audit ({backend} backend, {a0['n_events']} events per run). Raw and "
+               f"guarded scores are computed on the same {a0.get('n_generated', '?')} generated "
+               "responses per run, so the difference is the effect of the guardrails alone; "
+               f"fallback abstentions (abstain mode {fallbacks.get('abstain_mode', 0)}, LLM "
+               f"errors {fallbacks.get('llm_error', 0)}, invalid output "
+               f"{fallbacks.get('schema_invalid', 0)}) are excluded. Raw groundedness "
                f"{_cap(*_mean_std([a['raw']['groundedness'] for a in audits]))}, after "
                f"guardrails {_cap(*_mean_std([a['guarded']['groundedness'] for a in audits]))}; "
                f"fabricated citations in raw output "
@@ -537,23 +595,46 @@ FIGURES: dict[str, Callable[[list[RunArtifacts]], Any]] = {
 
 def generate_all(run_dirs: list[Path], out_dir: Path | None = None,
                  formats: list[str] | None = None, latex: str = "auto",
-                 only: list[str] | None = None) -> Path:
-    """Render every figure for the given runs into a new directory."""
+                 only: list[str] | None = None, allow_duplicates: bool = False) -> Path:
+    """Render every figure for the given runs into a new directory.
+
+    Figures are rendered into a temporary sibling directory that is renamed to
+    ``out_dir`` only when every figure succeeded, so a failure never leaves a
+    partial output behind.
+    """
     global _USETEX
     formats = formats or ["pdf", "svg"]
     runs = [RunArtifacts.load(Path(d)) for d in run_dirs]
     hashes = sorted({r.metrics["config_hash"] for r in runs})
     if len(hashes) > 1:
         raise ValueError(f"figures mix runs from different configurations: {hashes}")
+    check_independent_runs([r.metrics for r in runs], allow_duplicates)
     ids = "|".join(sorted(r.metrics["run_id"] for r in runs))
     if out_dir is None:
         tag = hashlib.sha256(ids.encode()).hexdigest()[:8]
         root = runs[0].run_dir.parent.parent / "figures"
         out_dir = root / f"{utc_stamp()}_{runs[0].metrics['experiment']}_{tag}"
-    out_dir = Path(out_dir)
-    if out_dir.exists() and any(out_dir.iterdir()):
-        raise FileExistsError(f"{out_dir} is not empty; figures are never overwritten")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    final_dir = Path(out_dir)
+    if final_dir.exists() and any(final_dir.iterdir()):
+        raise FileExistsError(f"{final_dir} is not empty; figures are never overwritten")
+    out_dir = final_dir.with_name(final_dir.name + ".partial")
+    if out_dir.exists():
+        raise FileExistsError(f"{out_dir} exists (an interrupted earlier call?); remove it")
+    out_dir.mkdir(parents=True)
+    try:
+        _render(runs, out_dir, formats, latex, only, hashes[0])
+    except BaseException:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
+    if final_dir.exists():
+        final_dir.rmdir()  # empty (checked above)
+    out_dir.rename(final_dir)
+    return final_dir
+
+
+def _render(runs: list[RunArtifacts], out_dir: Path, formats: list[str], latex: str,
+            only: list[str] | None, config_hash: str) -> None:
+    global _USETEX
     _USETEX = apply_style(latex)  # type: ignore[arg-type]
     written: dict[str, list[str]] = {}
     captions: list[str] = []
@@ -573,7 +654,7 @@ def generate_all(run_dirs: list[Path], out_dir: Path | None = None,
         "runs": [{"run_id": r.metrics["run_id"], "path": str(r.run_dir),
                   "manifest_sha256": sha256_file(r.run_dir / "manifest.json")
                   if (r.run_dir / "manifest.json").exists() else None} for r in runs],
-        "config_hash": hashes[0],
+        "config_hash": config_hash,
         "formats": formats,
         "pgf_skipped": "pgf" in formats and not latex_available(),
         "usetex": _USETEX,
@@ -582,4 +663,3 @@ def generate_all(run_dirs: list[Path], out_dir: Path | None = None,
     }
     (out_dir / "figures_manifest.json").write_text(json.dumps(manifest, indent=2),
                                                    encoding="utf-8")
-    return out_dir

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -68,6 +69,11 @@ def test_metrics_cover_imbalance_and_calibration(run_dir: Path) -> None:
     assert set(gate) == {"baseline", "junior_day", "senior_overloaded", "night_shift"}
     assert sum(gate["baseline"]["mode_counts"].values()) == m["operational"]["n_rows"]
     assert m["copilot"]["n_events"] > 0 and m["copilot"]["schema_valid_rate"] == 1.0
+    assert m["trust"]["epistemic_reference_detection"] > 0
+    unc = m["operational"]["uncertainty"]
+    assert set(unc["error_detection_auroc"]) == {
+        "epistemic", "aleatoric", "one_minus_trust_adjusted_confidence", "inconsistency"}
+    assert "epistemic_max_over_models" in unc["error_detection_auroc_gate_signals"]
 
 
 def test_predictions_belong_to_the_test_period(run_dir: Path) -> None:
@@ -87,7 +93,11 @@ def test_same_seed_reproduces_metrics_and_predictions(run_dir: Path, tmp_path: P
     assert a == b
     assert sha256_file(run_dir / "predictions_test.csv.gz") == \
         sha256_file(again / "predictions_test.csv.gz")
-    summary, table = aggregate_runs([run_dir, again])
+    with pytest.raises(ValueError, match="seeds repeat"):
+        aggregate_runs([run_dir, again])  # replicas are not independent samples
+    with pytest.raises(ValueError, match="more than once"):
+        aggregate_runs([run_dir, run_dir])
+    summary, table = aggregate_runs([run_dir, again], allow_duplicates=True)
     assert summary["config_hashes"] == [a["config_hash"]]
     row = table.set_index("metric").loc["models.detection.temperature.classification.pr_auc"]
     assert row["std"] == 0.0 and row["n"] == 2
@@ -99,7 +109,12 @@ def test_raw_csv_is_never_modified(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
     raw = raw_dir / "plant.csv"
-    frame.drop(columns=["attack_type", "phase", "campaign_id"]).to_csv(raw, index=False)
+    n = len(frame)
+    frame = frame.drop(columns=["attack_type", "phase", "campaign_id"])
+    # available in train only (kept), and missing throughout train (dropped on train data)
+    frame["LATE_FAIL"] = np.where(np.arange(n) < 0.45 * n, 1.0, np.nan)
+    frame["EARLY_FAIL"] = np.where(np.arange(n) < 0.7 * n, np.nan, 1.0)
+    frame.to_csv(raw, index=False)
     raw.chmod(0o444)
     before = sha256_file(raw)
     cfg = load_config(SMOKE, TINY_OVERRIDES + [
@@ -109,6 +124,7 @@ def test_raw_csv_is_never_modified(tmp_path: Path) -> None:
     integrity = read_json(result.run_dir / "raw_data_integrity.json")
     assert integrity["all_unchanged"] and sha256_file(raw) == before
     assert not (result.run_dir / "copilot_outputs.jsonl").exists()
+    assert result.metrics["preparation"]["dropped_low_train_coverage"] == ["EARLY_FAIL"]
 
 
 def test_figures_are_generated_without_overwriting(run_dir: Path, tmp_path: Path) -> None:
@@ -121,3 +137,22 @@ def test_figures_are_generated_without_overwriting(run_dir: Path, tmp_path: Path
     assert (out / "captions.md").read_text().startswith("# Draft figure captions")
     with pytest.raises(FileExistsError):
         generate_all([run_dir], out, formats=["pdf"], latex="off")
+    with pytest.raises(ValueError, match="more than once"):
+        generate_all([run_dir, run_dir], tmp_path / "dup", formats=["pdf"], latex="off")
+    assert not (tmp_path / "dup").exists() and not (tmp_path / "dup.partial").exists()
+
+
+def test_onset_mode_keeps_ongoing_attacks_and_figures_need_no_baseline_method(
+        tmp_path: Path) -> None:
+    cfg = load_config(SMOKE, TINY_OVERRIDES + ["labels.future_mode=onset",
+                                               "calibration.compare_methods=[temperature]"])
+    result = ExperimentRunner(cfg, output_root=tmp_path / "runs").run()
+    op = result.metrics["operational"]
+    ongoing = sum(op["gate"]["baseline"]["crosstab"]["ongoing"].values())
+    preds = pd.read_csv(result.run_dir / "predictions_test.csv.gz")
+    assert ongoing == int(preds["y_now"].sum()) > 0  # every attack-in-progress row is counted
+    assert op["gate"]["baseline"]["ongoing_coverage"] is not None
+    assert "none" in result.metrics["models"]["detection"]  # uncalibrated reference kept
+    out = generate_all([result.run_dir], tmp_path / "figs", formats=["pdf"], latex="off")
+    assert (out / "fig_reliability_diagrams.pdf").exists()
+    assert (out / "fig_horizon_performance.pdf").exists()

@@ -17,6 +17,7 @@ import numpy as np
 __all__ = ["binary_entropy", "decompose_uncertainty"]
 
 _EPS = 1e-12
+_MIN_EPISTEMIC_BITS = 1e-9
 
 
 def binary_entropy(p: np.ndarray) -> np.ndarray:
@@ -32,6 +33,9 @@ def decompose_uncertainty(member_probs: np.ndarray) -> dict[str, np.ndarray]:
     total = binary_entropy(mean)
     aleatoric = binary_entropy(probs).mean(axis=0)
     epistemic = np.clip(total - aleatoric, 0.0, None)
+    # Identical members leave ~1e-16 bits of rounding noise; it must never become a
+    # data-driven abstention threshold, so anything below 1e-9 bits is exactly zero.
+    epistemic = np.where(epistemic < _MIN_EPISTEMIC_BITS, 0.0, epistemic)
     return {
         "mean": mean,
         "total": total,

@@ -58,14 +58,22 @@ DEFAULT_GLOSSARY: dict[str, str] = {
     r"(?i)http": "http web requests injection",
 }
 
-# Phrases that describe an action taken without a human in the loop. Plain uses of
-# "automatic" (e.g. "automatic control loops") are deliberately not matched.
+# Phrases that describe a containment action taken without a human in the loop, in
+# either word order ("automatically block" / "block ... automatically|immediately|now")
+# or explicitly skipping approval. Plain uses of "automatic" (e.g. "automatic control
+# loops") are not matched. The check is conservative: a match only forces approval.
+_ACTION_VERB = (r"(?:block|isolat|shut\s*(?:down|off)|disconnect|quarantin|stop|kill|disabl|"
+                r"terminat|cut\s+off|null-?rout|reset|reboot|restart|power\s*(?:off|down))\w*")
 _AUTONOMOUS = re.compile(
-    r"\b(automatic(ally)?\s+(block|isolat|shut|disconnect|quarantin|stop|kill|disabl)\w*"
-    r"|auto-?(block|isolat|quarantin|shutdown)\w*"
-    r"|without\s+(analyst\s+|human\s+|operator\s+)?(approval|review|confirmation)"
-    r"|immediately\s+(shut\s*down|disconnect|block|isolate|stop))",
-    re.IGNORECASE,
+    rf"\bautomatic(?:ally)?\b.{{0,40}}?\b{_ACTION_VERB}"
+    rf"|\b{_ACTION_VERB}\b.{{0,60}}?\b(?:automatic(?:ally)?|immediately|right\s+away|"
+    r"at\s+once|now)\b"
+    rf"|\bauto-?{_ACTION_VERB}"
+    rf"|\bimmediately\b.{{0,20}}?\b{_ACTION_VERB}"
+    r"|\bwithout\b.{0,30}?\b(?:approval|review|confirmation|authori[sz]ation|consent|"
+    r"sign-?off)\b"
+    r"|\bno\s+(?:need\s+(?:for|to\s+wait\s+for)\s+)?(?:approval|confirmation|review)\b",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -120,6 +128,9 @@ def enforce_policy(response: dict[str, Any], packet: dict[str, Any],
     approval_all = mode == AssistanceMode.RECOMMEND_WITH_APPROVAL or \
         gate.get("recommendations_require_approval", False)
     retrieved = {k["chunk_id"] for k in packet.get("knowledge", [])}
+    # Containment / response / recovery guidance always needs analyst approval.
+    approval_chunks = {k["chunk_id"] for k in packet.get("knowledge", [])
+                       if k.get("requires_approval")}
     allowed_refs = set(packet.get("allowed_signal_refs", []))
     out = copy.deepcopy(response)
     violations: list[str] = []
@@ -160,8 +171,11 @@ def enforce_policy(response: dict[str, Any], packet: dict[str, Any],
             violations.append("uncited_step")
             continue
         step["citations"] = kept
-        if _AUTONOMOUS.search(step["action"]):
+        if _AUTONOMOUS.search(f"{step['action']} {step.get('rationale', '')}"):
             violations.append("autonomous_action_language")
+            step["requires_human_approval"] = True
+        if set(kept) & approval_chunks and not step["requires_human_approval"]:
+            violations.append("containment_without_approval")
             step["requires_human_approval"] = True
         if approval_all and not step["requires_human_approval"]:
             violations.append("missing_approval_flag")
@@ -321,9 +335,12 @@ class CognitiveCopilot:
         try:
             llm_out = self.llm.generate(request)
         except LLMError as exc:
+            # No structured output was produced; the raw error stays out of the analyst text
+            # (it would also be audited as ungrounded numbers/identifiers).
             result.error = str(exc)
+            result.schema_valid = False
             result.violations = ["llm_error"]
-            result.response = self.abstention(packet, f"LLM unavailable ({exc})")
+            result.response = self.abstention(packet, "the language model was unavailable")
             result.audit_guarded = audit_response(result.response, packet,
                                                   self.cfg.support_threshold)
             return result

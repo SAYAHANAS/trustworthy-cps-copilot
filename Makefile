@@ -6,7 +6,7 @@ RUN = PYTHONPATH=src $(PY) -m cpscopilot.cli
 install:            ## editable install with dev + LLM extras
 	$(PY) -m pip install -e ".[dev,llm]"
 
-test:               ## full suite incl. end-to-end runs (~30 s)
+test:               ## full suite incl. end-to-end runs (~1 min)
 	$(PY) -m pytest
 
 test-fast:          ## unit tests only

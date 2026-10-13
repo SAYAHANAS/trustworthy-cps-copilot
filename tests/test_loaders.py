@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from cpscopilot.config import DatasetConfig
+from cpscopilot.data.features import segment_ids
 from cpscopilot.data.loaders import load_dataset
 from cpscopilot.data.schema import LABEL, TIMESTAMP, CPSDataset
 from cpscopilot.utils.io import sha256_file
@@ -52,12 +53,15 @@ def test_wadi_format_with_long_tags_and_signed_labels(tmp_path: Path) -> None:
     assert ds.labels.tolist() == [0, 0, 0, 1, 0]
 
 
-def test_ton_iot_events_are_binned_causally(tmp_path: Path) -> None:
+def test_ton_iot_flows_are_binned_at_their_observable_end_time(tmp_path: Path) -> None:
+    t0 = 1556000000
     raw = pd.DataFrame({
-        "ts": [1556000001, 1556000004, 1556000010, 1556000012, 1556000025],
-        "src_ip": ["a", "b", "a", "c", "a"], "dst_port": [80, 80, 22, 23, 80],
-        "src_bytes": [100, 50, 10, 999, 1], "duration": [0.1, 0.2, 0.3, 0.4, 0.5],
-        "label": [0, 0, 0, 1, 0], "type": ["normal", "normal", "normal", "scanning", "normal"],
+        "ts": [t0 + 1, t0 + 4, t0 + 10, t0 + 2, t0 + 12, t0 + 25],
+        "duration": [0.0, 2.0, 0.0, 25.0, 0.4, 0.5],
+        "src_ip": ["a", "b", "a", "d", "c", "a"], "dst_port": [80, 80, 22, 443, 23, 80],
+        "src_bytes": [100, 50, 10, 5000, 999, 1],
+        "label": [0, 0, 0, 0, 1, 0],
+        "type": ["normal", "normal", "normal", "normal", "scanning", "normal"],
     })
     raw.to_csv(tmp_path / "net.csv", index=False)
     cfg = DatasetConfig(name="ton_iot", paths=["net.csv"], timestamp_col="ts",
@@ -65,15 +69,42 @@ def test_ton_iot_events_are_binned_causally(tmp_path: Path) -> None:
                         attack_type_col="type", feature_include=["src_bytes", "duration"],
                         count_distinct_cols=["src_ip", "dst_port"], resample_seconds=10,
                         resample_aggs=["sum", "max"])
-    ds = load_dataset(cfg, resolver(tmp_path), 0)
+    ds = load_dataset(cfg, resolver(tmp_path), 0)  # ton_iot defaults to duration shifting
     f = ds.frame.set_index(TIMESTAMP)
-    first = pd.Timestamp(1556000010, unit="s")
-    assert f.loc[first, "src_bytes__sum"] == 160  # events at 1, 4 and 10 s -> bin (0, 10]
+    first = pd.Timestamp(t0 + 10, unit="s")
+    # the 25 s flow that *started* at t0+2 is only observable at t0+27: not in bin (0, 10]
+    assert f.loc[first, "src_bytes__sum"] == 160
     assert f.loc[first, "src_ip__nunique"] == 2
     assert f.loc[first, "event_count"] == 3
-    second = pd.Timestamp(1556000020, unit="s")
+    second = pd.Timestamp(t0 + 20, unit="s")
     assert f.loc[second, LABEL] == 1 and f.loc[second, "attack_type"] == "scanning"
+    third = pd.Timestamp(t0 + 30, unit="s")
+    assert f.loc[third, "src_bytes__sum"] == 5001 and f.loc[third, "duration__max"] == 25.0
     assert "src_ip" not in ds.feature_cols  # raw identifiers are never features
+
+
+def test_resampling_drops_outages_and_starts_a_new_segment(tmp_path: Path) -> None:
+    t0 = pd.Timestamp("2026-01-01")
+    before = t0 + pd.to_timedelta(np.arange(0, 600, 3), "s")
+    short_gap_end = before[-1] + pd.Timedelta(seconds=35)  # 3 empty 10 s bins: a dropout
+    middle = short_gap_end + pd.to_timedelta(np.arange(0, 300, 3), "s")
+    after = middle[-1] + pd.Timedelta(hours=2) + pd.to_timedelta(np.arange(0, 600, 3), "s")
+    ts = before.append(middle).append(after)
+    label = np.zeros(len(ts), dtype=int)
+    label[len(before) - 20: len(before)] = 1  # attack running into the short dropout
+    raw = pd.DataFrame({"ts": ts.astype(str), "x": np.arange(len(ts), dtype=float),
+                        "label": label})
+    raw.to_csv(tmp_path / "plant.csv", index=False)
+    cfg = DatasetConfig(name="generic_csv", paths=["plant.csv"], timestamp_col="ts",
+                        label_col="label", resample_seconds=10, max_gap_factor=60)
+    ds = load_dataset(cfg, resolver(tmp_path), 0)
+    stats = ds.fingerprint["resampling"]
+    assert stats["bins_dropped_outage"] > 700  # the 2-hour outage is not filled
+    assert stats["bins_empty"] - stats["bins_dropped_outage"] == 3  # the dropout is kept
+    segs = segment_ids(ds.frame[TIMESTAMP], ds.sampling_seconds, cfg.max_gap_factor)
+    assert len(np.unique(segs)) == 2
+    kept_empty = ds.frame[ds.frame["event_count"] == 0]
+    assert len(kept_empty) == 3 and (kept_empty[LABEL] == 1).all()  # inherits attack state
 
 
 def test_generic_csv_and_attack_intervals(tmp_path: Path) -> None:
@@ -87,6 +118,41 @@ def test_generic_csv_and_attack_intervals(tmp_path: Path) -> None:
     ds = load_dataset(cfg, resolver(tmp_path), 0)
     assert ds.labels.tolist() == [0, 0, 0, 1, 1, 1, 0, 0, 0, 0]
     assert set(ds.frame.loc[ds.frame[LABEL] == 1, "attack_type"]) == {"spoof"}
+    assert ds.fingerprint["attack_intervals"][0]["rows_matched"] == 3
+
+
+def test_attack_intervals_respect_day_first_and_must_match(tmp_path: Path) -> None:
+    ts = pd.date_range("2017-10-09 19:00", "2017-10-11 12:00", freq="10min")
+    pd.DataFrame({"time": ts.strftime("%d/%m/%Y %H:%M:%S"), "x": np.arange(len(ts), dtype=float)}
+                 ).to_csv(tmp_path / "plant.csv", index=False)
+    pd.DataFrame({"start": ["9/10/2017 19:25:00", "10/10/2017 10:20:00", "11/10/2017 11:10:00"],
+                  "end": ["9/10/2017 19:50:00", "10/10/2017 10:40:00", "11/10/2017 11:40:00"]}
+                 ).to_csv(tmp_path / "attacks.csv", index=False)
+    cfg = DatasetConfig(name="generic_csv", paths=["plant.csv"], timestamp_col="time",
+                        timestamp_format="%d/%m/%Y %H:%M:%S", dayfirst=True,
+                        attack_intervals_path="attacks.csv")
+    ds = load_dataset(cfg, resolver(tmp_path), 0)  # all three day-first intervals match
+    assert [r["rows_matched"] for r in ds.fingerprint["attack_intervals"]] == [3, 3, 4]
+    with pytest.raises(ValueError, match="matches no rows"):
+        load_dataset(cfg.model_copy(update={"dayfirst": False}), resolver(tmp_path), 0)
+    pd.DataFrame({"start": ["10/10/2017 10:40:00"], "end": ["10/10/2017 10:20:00"]}).to_csv(
+        tmp_path / "bad.csv", index=False)
+    with pytest.raises(ValueError, match="ends before it starts"):
+        load_dataset(cfg.model_copy(update={"attack_intervals_path": "bad.csv"}),
+                     resolver(tmp_path), 0)
+
+
+def test_partially_missing_columns_are_not_screened_on_the_whole_file(tmp_path: Path) -> None:
+    n = 100
+    late_fail = np.r_[np.arange(45.0), np.full(n - 45, np.nan)]  # fails in calibration/test
+    pd.DataFrame({"time": pd.date_range("2026-01-01", periods=n, freq="10s").astype(str),
+                  "x": np.arange(float(n)), "late": late_fail, "text": ["-"] * n,
+                  "label": [0] * n}).to_csv(tmp_path / "plant.csv", index=False)
+    cfg = DatasetConfig(name="generic_csv", paths=["plant.csv"], timestamp_col="time",
+                        label_col="label")
+    ds = load_dataset(cfg, resolver(tmp_path), 0)
+    assert "late" in ds.feature_cols  # usability is decided on the train split later
+    assert "text" not in ds.feature_cols  # no numeric value at all
 
 
 def test_synthetic_is_seed_deterministic() -> None:

@@ -9,7 +9,10 @@ output_root: runs
 
 dataset:
   name: synthetic
-  max_gap_factor: 5.0          # timestamp gap (x sampling period) that starts a new segment
+  max_gap_factor: 5.0          # timestamp gap (x sampling period) that starts a new segment;
+                               # with resampling, longer runs of empty bins are dropped
+  event_duration_col: null     # flow logs: bin each record at ts + this duration (seconds)
+  attack_intervals_format: null  # strptime format of an attack-interval file (null: dayfirst)
   synthetic:
     days: 4.0
     sampling_seconds: 10
@@ -35,6 +38,7 @@ features:                      # trailing (causal) windows, in rows
   include_raw: true
   diff_lags: [1]
   ffill_limit: null
+  min_train_coverage: 0.5      # drop columns with less non-missing data in the train split
 
 labels:
   horizons_minutes: [5, 15, 30]

@@ -99,9 +99,17 @@ class DatasetConfig(_Strict):
         default_factory=lambda: ["mean"]
     )
     sampling_seconds: float | None = Field(None, gt=0)
-    max_gap_factor: float = Field(5.0, gt=1)
+    max_gap_factor: float = Field(
+        5.0, gt=1,
+        description="A gap longer than this many sampling periods starts a new segment; with "
+                    "resampling, longer runs of empty bins (outages) are dropped, not filled.")
     max_rows: int | None = Field(None, gt=0)
+    event_duration_col: str | None = Field(
+        None, description="Flow records (e.g. Zeek conn logs) only become observable when the "
+                          "connection ends: shift each record's time by this column (seconds).")
     attack_intervals_path: str | None = None
+    attack_intervals_format: str | None = Field(
+        None, description="strptime format of the interval file; None = infer with dayfirst.")
     read_csv_kwargs: dict[str, Any] = Field(default_factory=dict)
     synthetic: SyntheticConfig = Field(default_factory=SyntheticConfig)
 
@@ -141,6 +149,10 @@ class FeatureConfig(_Strict):
     include_raw: bool = True
     diff_lags: list[int] = Field(default_factory=lambda: [1])
     ffill_limit: int | None = Field(None, ge=1)
+    min_train_coverage: float = Field(
+        0.5, ge=0, le=1,
+        description="Drop input columns with a smaller fraction of non-missing values in the "
+                    "training split (decided on train only).")
 
     @field_validator("windows")
     @classmethod

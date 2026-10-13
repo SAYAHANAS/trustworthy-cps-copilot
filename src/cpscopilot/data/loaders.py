@@ -15,7 +15,22 @@ Raw files are opened read-only and fingerprinted with SHA-256 so the runner
 can prove after the run that they were not modified. Loaders never write.
 
 Resampling is causal: bin ``(t - Δ, t]`` is labelled with its *right* edge, so
-the aggregated value at ``t`` only summarises observations up to ``t``.
+the aggregated value at ``t`` only summarises observations up to ``t``. Two
+details keep that true for real data:
+
+* **Outages are not filled.** A run of empty bins longer than
+  ``max_gap_factor`` sampling periods is dropped, so the remaining timestamps
+  jump and :func:`cpscopilot.data.features.segment_ids` starts a new segment;
+  no window, difference, forward-fill or future label spans the outage, and no
+  outage bin becomes a (fake) benign row. Shorter dropouts are kept as empty
+  bins that inherit the previous bin's attack state.
+* **Flow records are placed at their observable time.** A connection log
+  summarises the whole connection (bytes, duration, final state), which is only
+  known when it ends; with ``event_duration_col`` each record is shifted to
+  ``ts + duration`` before binning.
+
+Decisions about which columns are usable (missingness) are made later on the
+training split only (``features.min_train_coverage``), never on the whole file.
 """
 
 from __future__ import annotations
@@ -100,20 +115,45 @@ def _select_features(raw: pd.DataFrame, cfg: DatasetConfig, reserved: set[str]) 
     return [c for c in selected if c not in excluded]
 
 
-def _apply_attack_intervals(frame: pd.DataFrame, path: Path) -> None:
+def _parse_interval_times(values: pd.Series, cfg: DatasetConfig) -> pd.Series:
+    text = values.astype(str).str.strip()
+    if cfg.attack_intervals_format:
+        return pd.to_datetime(text, format=cfg.attack_intervals_format)
+    return pd.to_datetime(text, dayfirst=cfg.dayfirst)
+
+
+def _apply_attack_intervals(frame: pd.DataFrame, path: Path,
+                            cfg: DatasetConfig) -> list[dict[str, Any]]:
+    """Label rows inside each ``[start, end]`` interval; every interval must match rows.
+
+    Interval times are parsed with ``attack_intervals_format`` (or the dataset's
+    ``dayfirst`` convention), never with a guessed format, because attack tables
+    and data files often use different day/month orders.
+    """
     intervals = pd.read_csv(path)
     required = {"start", "end"}
     if not required <= set(intervals.columns):
         raise ValueError(f"attack interval file needs columns {sorted(required)}")
-    starts = pd.to_datetime(intervals["start"])
-    ends = pd.to_datetime(intervals["end"])
+    starts = _parse_interval_times(intervals["start"], cfg)
+    ends = _parse_interval_times(intervals["end"], cfg)
     types = intervals["attack_type"] if "attack_type" in intervals else pd.Series(
         ["attack"] * len(intervals))
     ts = frame[TIMESTAMP]
-    for s, e, a in zip(starts, ends, types):
+    report = []
+    for i, (s, e, a) in enumerate(zip(starts, ends, types)):
+        if e < s:
+            raise ValueError(f"attack interval {i} ends before it starts: {s} > {e}")
         mask = (ts >= s) & (ts <= e)
+        matched = int(mask.sum())
+        if matched == 0:
+            raise ValueError(
+                f"attack interval {i} ({s} .. {e}) matches no rows (data spans "
+                f"{ts.min()} .. {ts.max()}); check attack_intervals_format / dayfirst")
         frame.loc[mask, LABEL] = 1
         frame.loc[mask, ATTACK_TYPE] = str(a)
+        report.append({"start": str(s), "end": str(e), "attack_type": str(a),
+                       "rows_matched": matched})
+    return report
 
 
 def _mode_attack_type(values: pd.Series) -> str:
@@ -131,12 +171,21 @@ def resample_causal(
     seconds: int,
     aggs: list[str],
     count_distinct_cols: list[str] | None = None,
+    max_gap_bins: float | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Aggregate rows into right-closed, right-labelled bins of ``seconds``.
 
     Returns the resampled frame and its feature names. The label of a bin is the
     maximum label inside it (any attack activity), the attack type is the most
     frequent non-benign type, and ``event_count`` counts raw rows per bin.
+
+    Args:
+        max_gap_bins: runs of ``L`` consecutive empty bins with ``L + 1 >
+            max_gap_bins`` (i.e. outages that would start a new segment) are
+            dropped instead of being emitted as empty rows. Shorter runs are kept
+            and inherit the previous bin's label/attack type. ``None`` keeps all.
+        stats: optional dict that receives bin counts for provenance.
     """
     rule = f"{int(seconds)}s"
     indexed = frame.set_index(TIMESTAMP)
@@ -160,10 +209,22 @@ def resample_causal(
         parts.append(nunique.to_frame())
         names.append(nunique.name)
     out = pd.concat(parts, axis=1)
-    out[LABEL] = grouper[LABEL].max().fillna(0).astype(np.int8)
+    empty = counts.to_numpy() == 0
+    # Short dropouts inherit the previous bin's state (an attack does not pause
+    # because one poll was lost); the first bin always holds the first record.
+    out[LABEL] = grouper[LABEL].max().ffill().fillna(0).astype(np.int8)
     if ATTACK_TYPE in indexed:
-        out[ATTACK_TYPE] = grouper[ATTACK_TYPE].apply(_mode_attack_type).reindex(out.index)
-        out[ATTACK_TYPE] = out[ATTACK_TYPE].fillna(BENIGN_TYPE)
+        types = grouper[ATTACK_TYPE].apply(_mode_attack_type).reindex(out.index)
+        out[ATTACK_TYPE] = types.where(~empty).ffill().fillna(BENIGN_TYPE)
+    drop = np.zeros(len(out), dtype=bool)
+    if max_gap_bins is not None and empty.any():
+        anchor = np.cumsum(~empty)  # empty bins share the id of the preceding filled bin
+        run_len = pd.Series(empty.astype(int)).groupby(anchor).transform("sum").to_numpy()
+        drop = empty & (run_len + 1 > max_gap_bins)
+    if stats is not None:
+        stats.update({"bins_total": int(len(out)), "bins_empty": int(empty.sum()),
+                      "bins_dropped_outage": int(drop.sum())})
+    out = out[~drop]
     out = out.reset_index().rename(columns={"index": TIMESTAMP})
     return out, names
 
@@ -187,10 +248,15 @@ def _finalise(
                 "categorical_cols cannot be averaged into time bins; list them under "
                 "dataset.count_distinct_cols when resample_seconds is set"
             )
+        resample_stats: dict[str, Any] = {}
         frame, feature_cols = resample_causal(
             frame, feature_cols, cfg.resample_seconds, list(cfg.resample_aggs),
-            cfg.count_distinct_cols,
+            cfg.count_distinct_cols, max_gap_bins=cfg.max_gap_factor, stats=resample_stats,
         )
+        fingerprint["resampling"] = resample_stats
+        if resample_stats.get("bins_dropped_outage"):
+            log.info("dropped %d empty bins inside data outages", resample_stats[
+                "bins_dropped_outage"])
         meta_cols = [c for c in meta_cols if c in frame.columns]
     elif n_dup:
         log.warning("%d duplicate timestamps found; keeping the last observation", n_dup)
@@ -210,6 +276,8 @@ def _finalise(
     else:
         deltas = frame[TIMESTAMP].diff().dt.total_seconds().dropna()
         sampling = float(deltas.median()) if len(deltas) else 1.0
+        log.warning("sampling period inferred from the data (%.3f s); set "
+                    "dataset.sampling_seconds to fix it explicitly", sampling)
     if ATTACK_TYPE not in frame:
         frame[ATTACK_TYPE] = np.where(frame[LABEL] == 1, "attack", BENIGN_TYPE)
     meta_cols = sorted(set(meta_cols) | {ATTACK_TYPE})
@@ -241,7 +309,13 @@ def _from_table(raw: pd.DataFrame, cfg: DatasetConfig, source: str,
                 paths: list[Path], resolve: Callable[[str], Path]) -> CPSDataset:
     if cfg.label_col is None and cfg.attack_intervals_path is None:
         raise ValueError("set dataset.label_col or dataset.attack_intervals_path")
-    columns: dict[str, Any] = {TIMESTAMP: _parse_timestamps(raw, cfg).to_numpy()}
+    timestamps = _parse_timestamps(raw, cfg)
+    if cfg.event_duration_col:
+        # A flow record is only observable once the connection has ended.
+        duration = pd.to_numeric(raw[cfg.event_duration_col], errors="coerce")
+        timestamps = timestamps + pd.to_timedelta(duration.fillna(0.0).clip(lower=0.0),
+                                                  unit="s")
+    columns: dict[str, Any] = {TIMESTAMP: timestamps.to_numpy()}
     if cfg.label_col is not None:
         columns[LABEL] = _binary_labels(raw[cfg.label_col], cfg.positive_labels)
     else:
@@ -256,18 +330,20 @@ def _from_table(raw: pd.DataFrame, cfg: DatasetConfig, source: str,
     feature_cols: list[str] = []
     for col in _select_features(raw, cfg, reserved):
         values = pd.to_numeric(raw[col], errors="coerce")
-        if values.notna().mean() < 0.5:
-            log.info("skipping mostly non-numeric column %r", col)
+        if values.notna().sum() == 0:  # no numeric value anywhere (text column)
+            log.info("skipping non-numeric column %r", col)
             continue
+        # Partial missingness is judged on the training split only (runner).
         columns[col] = values.to_numpy(dtype=np.float64)
         feature_cols.append(col)
     for col in [*cfg.categorical_cols, *cfg.count_distinct_cols]:
         if col in raw and col not in columns:
             columns[col] = raw[col].astype(str).str.strip().to_numpy()
     frame = pd.DataFrame(columns)
+    fingerprint: dict[str, Any] = {"files": fingerprint_files(paths), "loader": source}
     if cfg.attack_intervals_path:
-        _apply_attack_intervals(frame, resolve(cfg.attack_intervals_path))
-    fingerprint = {"files": fingerprint_files(paths), "loader": source}
+        fingerprint["attack_intervals"] = _apply_attack_intervals(
+            frame, resolve(cfg.attack_intervals_path), cfg)
     return _finalise(frame, feature_cols, cfg, source, fingerprint, [ATTACK_TYPE],
                      categorical_cols=list(cfg.categorical_cols))
 
@@ -334,5 +410,7 @@ def load_dataset(cfg: DatasetConfig, resolve: Callable[[str], Path], seed: int) 
     if cfg.name == "ton_iot":
         if not cfg.resample_seconds:
             raise ValueError("TON_IoT events are irregular: set dataset.resample_seconds")
+        if cfg.event_duration_col is None and "duration" in raw.columns:
+            cfg = cfg.model_copy(update={"event_duration_col": "duration"})
         return _from_table(raw, cfg, "ton_iot", paths, resolve)
     return _from_table(raw, cfg, "generic_csv", paths, resolve)

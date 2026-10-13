@@ -89,9 +89,11 @@ class TrustRiskLayer:
         self.scorer = scorer
         self.base_cols = list(base_cols)
         self.primary = calibration_cfg.method
-        self.methods = sorted(set(calibration_cfg.compare_methods) | {self.primary})
+        # "none" is always kept as the uncalibrated reference for evaluation and figures.
+        self.methods = sorted(set(calibration_cfg.compare_methods) | {self.primary, "none"})
         self.calibrators: dict[str, dict[str, Calibrator]] = {}
         self.epistemic_reference_: float | None = None
+        self.epistemic_reference_detection_: float | None = None
         self.thresholds_: dict[str, float] | None = None
         self.horizon_weights = {
             key: float(trust_cfg.horizon_weights.get(
@@ -121,14 +123,23 @@ class TrustRiskLayer:
 
     def calibrate(self, key: str, members: np.ndarray,
                   method: str | None = None) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(calibrated ensemble mean, calibrated members)``."""
+        """Return ``(calibrated ensemble mean, members for the uncertainty decomposition)``.
+
+        Members are mapped with the same calibrator only when it is a smooth
+        monotone map (``memberwise``); otherwise the raw members are returned, so
+        epistemic uncertainty always reflects genuine member disagreement.
+        """
         cal = self.calibrators[key][method or self.primary]
-        return cal.transform(members.mean(axis=0)), cal.transform(members)
+        mapped = cal.transform(members) if cal.memberwise else np.asarray(members, dtype=float)
+        return cal.transform(members.mean(axis=0)), mapped
 
     def fit_reference(self, frame_cal: pd.DataFrame, y_now_cal: np.ndarray) -> TrustRiskLayer:
         """Calibration-split references: epistemic scale and state thresholds."""
         q = self.cfg.epistemic_reference_quantile
         self.epistemic_reference_ = max(float(np.quantile(frame_cal["epistemic"], q)), 1e-6)
+        # Detection-only reference, for scores about the detection decision alone.
+        self.epistemic_reference_detection_ = max(
+            float(np.quantile(frame_cal["epi_detection"], q)), 1e-6)
         self.thresholds_ = select_state_thresholds(
             y_now_cal, frame_cal["p_detect"].to_numpy(), self.cfg.suspicious_recall_target)
         return self
@@ -220,6 +231,7 @@ class TrustRiskLayer:
             "calibrators": {k: {m: c.state_dict() for m, c in v.items()}
                             for k, v in self.calibrators.items()},
             "epistemic_reference": self.epistemic_reference_,
+            "epistemic_reference_detection": self.epistemic_reference_detection_,
             "state_thresholds": self.thresholds_,
             "horizon_weights": self.horizon_weights,
             "anomaly_scorer": self.scorer.state_dict(),

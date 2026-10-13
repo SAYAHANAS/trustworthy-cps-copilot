@@ -25,9 +25,13 @@ Notes per dataset:
   (`\\WIN-...\LOG_DATA\SUTD_WADI\LOG_DATA\1_AIT_001_PV`), which is removed. The
   2019 export's label column uses `1` = normal and `-1` = attack. For exports
   without labels, provide `attack_intervals_path` (CSV with `start,end[,attack_type]`).
-* **TON_IoT** flow records are irregular events; they are aggregated into
+  iTrust attack tables write dates day-first; set `attack_intervals_format` (or
+  `dayfirst: true`). Every interval must match at least one row, otherwise loading fails.
+* **TON_IoT** flow records are irregular events. Each record is placed at the time it
+  becomes observable (`ts + duration`, `event_duration_col`) and aggregated into
   right-closed bins (`resample_seconds`) with sums/means/maxima, event counts and
-  distinct counts of hosts/ports/services. Use the full chronological network
+  distinct counts of hosts/ports/services. Gaps longer than `max_gap_factor` bins are
+  treated as outages: their empty bins are dropped and a new segment starts. Use the full chronological network
   CSVs for temporal experiments - the sampled `train_test_network.csv` is not
   contiguous in time.
 

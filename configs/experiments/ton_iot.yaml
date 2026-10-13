@@ -1,6 +1,8 @@
-# TON_IoT (UNSW Canberra) network dataset. Irregular flow records are aggregated into
-# right-closed 10 s bins (sum/mean/max of numeric fields, event counts and distinct
-# counts of hosts/ports/services). Use the full chronological network CSVs for
+# TON_IoT (UNSW Canberra) network dataset. Irregular flow records are shifted to the
+# time they become observable (connection end) and aggregated into right-closed 10 s
+# bins (sum/mean/max of numeric fields, event counts and distinct counts of
+# hosts/ports/services). Outages longer than max_gap_factor bins are dropped and start
+# a new segment. Use the full chronological network CSVs for
 # temporal experiments; the sampled train_test_network.csv is not contiguous in time.
 extends: ../default.yaml
 name: ton-iot-network
@@ -11,6 +13,7 @@ dataset:
   paths: [data/raw/TON_IoT/network/train_test_network.csv]
   timestamp_col: ts
   timestamp_unit: s
+  event_duration_col: duration   # bin each flow at ts + duration (when it is observable)
   label_col: label
   positive_labels: [1]
   attack_type_col: type

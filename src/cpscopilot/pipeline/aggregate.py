@@ -19,7 +19,7 @@ from scipy import stats
 
 from cpscopilot.utils.io import read_json
 
-__all__ = ["aggregate_runs", "flatten_numeric"]
+__all__ = ["aggregate_runs", "check_independent_runs", "flatten_numeric"]
 
 _SKIP_PREFIXES = ("timings_seconds", "feature_importance", "dataset.", "preparation.")
 
@@ -37,15 +37,33 @@ def flatten_numeric(obj: Any, prefix: str = "") -> dict[str, float]:
     return out
 
 
-def aggregate_runs(run_dirs: list[Path], confidence: float = 0.95,
-                   allow_mixed: bool = False) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Return ``(summary, table)`` where ``table`` has one row per metric."""
+def check_independent_runs(metrics: list[dict[str, Any]], allow_duplicates: bool = False) -> None:
+    """Refuse repeated runs or seeds: identical replicas would shrink the s.d. and CI."""
+    if allow_duplicates:
+        return
+    run_ids = [m["run_id"] for m in metrics]
+    seeds = [m["seed"] for m in metrics]
+    if len(set(run_ids)) != len(run_ids):
+        raise ValueError(f"the same run was passed more than once: {sorted(run_ids)}")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"seeds repeat across runs {sorted(seeds)}; repeated seeds are exact "
+                         "replicas and would understate the across-seed variance")
+
+
+def aggregate_runs(run_dirs: list[Path], confidence: float = 0.95, allow_mixed: bool = False,
+                   allow_duplicates: bool = False) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Return ``(summary, table)`` where ``table`` has one row per metric.
+
+    Runs must share a configuration hash and be independent (distinct run ids and
+    distinct seeds) unless explicitly allowed.
+    """
     if not run_dirs:
         raise ValueError("no runs to aggregate")
     metrics = [read_json(Path(d) / "metrics.json") for d in run_dirs]
     hashes = sorted({m["config_hash"] for m in metrics})
     if len(hashes) > 1 and not allow_mixed:
         raise ValueError(f"runs come from different configurations: {hashes}")
+    check_independent_runs(metrics, allow_duplicates)
     flat = [flatten_numeric(m) for m in metrics]
     keys = sorted(set().union(*flat))
     rows = []

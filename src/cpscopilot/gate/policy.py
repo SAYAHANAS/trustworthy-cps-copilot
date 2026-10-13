@@ -42,7 +42,8 @@ import pandas as pd
 
 from cpscopilot.config import AnalystProfile, GateConfig
 
-__all__ = ["AssistanceGate", "AssistanceMode", "GateDecision", "GateThresholds", "RULES"]
+__all__ = ["AssistanceGate", "AssistanceMode", "GateDecision", "GateThresholds", "RULES",
+           "budget_threshold"]
 
 
 class AssistanceMode(StrEnum):
@@ -108,6 +109,20 @@ class GateDecision:
                 "thresholds": self.thresholds.as_dict()}
 
 
+def budget_threshold(values: np.ndarray, budget: float) -> float:
+    """Smallest threshold ``t`` with ``mean(values >= t) <= budget``.
+
+    A plain interpolated quantile combined with a ``>=`` rule admits every row tied
+    at the quantile, which overruns the budget when risks take few distinct values
+    (e.g. after isotonic calibration).
+    """
+    v = np.asarray(values, dtype=np.float64)
+    t = float(np.quantile(v, 1.0 - budget, method="higher"))
+    if np.mean(v >= t) > budget:
+        t = float(np.nextafter(t, np.inf))
+    return t
+
+
 class AssistanceGate:
     """Ordered, auditable policy over trust-layer outputs."""
 
@@ -142,7 +157,7 @@ class AssistanceGate:
                                  ("recommend", cfg.recommend_benign_budget)):
                 if budget is None:
                     continue
-                q = float(np.quantile(benign_risk, 1.0 - budget))
+                q = budget_threshold(benign_risk, budget)
                 if name == "explain" and q > explain:
                     explain, resolution[name] = q, f"benign budget {budget:g}"
                 if name == "recommend" and q > recommend:
