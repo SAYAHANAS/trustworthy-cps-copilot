@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 
 __all__ = [
+    "code_fingerprint",
     "environment_info",
     "read_json",
     "sha256_bytes",
@@ -138,6 +139,19 @@ def _git_info(cwd: Path) -> dict[str, Any]:
     }
 
 
+def code_fingerprint() -> str:
+    """SHA-256 over the framework's source files: identifies the code without git.
+
+    Line endings are normalised so that a Windows checkout gives the same digest.
+    """
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
+        digest.update(path.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    return digest.hexdigest()
+
+
 def environment_info(project_root: Path | None = None) -> dict[str, Any]:
     """Collect interpreter, platform, package and git provenance information."""
     packages: dict[str, str | None] = {}
@@ -154,5 +168,6 @@ def environment_info(project_root: Path | None = None) -> dict[str, Any]:
         "processor": platform.processor(),
         "packages": packages,
         "git": _git_info(project_root or Path.cwd()),
+        "code_sha256": code_fingerprint(),
         "argv": list(sys.argv),
     }

@@ -31,14 +31,24 @@ support. The analyst makes every decision.
 
 ```bash
 pip install -r requirements-lock.txt      # exact tested versions (or: pip install -e ".[dev,llm]")
-make test                                 # 173 tests, ~2 min
+make test                                 # 192 tests, ~2 min
 make smoke                                # one end-to-end run on the synthetic plant
 python scripts/generate_paper_figures.py runs/<run_id> --formats pdf svg pgf
 ```
 
 Everything runs offline by default: the synthetic plant needs no downloads, and the
 copilot uses the deterministic `template` backend. Real datasets go under
-`data/raw/` (see [`data/README.md`](data/README.md)).
+`data/raw/` (see [`data/README.md`](data/README.md) for the exact files and formats).
+
+The whole study (audit, every seed, aggregation, figures) is one command, on Linux,
+macOS and Windows alike; finished runs are reused when it is restarted. Windows
+users: see [`docs/WINDOWS.md`](docs/WINDOWS.md).
+
+```bash
+python scripts/run_study.py --datasets swat wadi --audit-only      # check the data first
+python scripts/run_study.py --datasets synthetic swat wadi --seeds 0 1 2 3 4
+python scripts/run_study.py --datasets swat wadi --backend anthropic   # Claude copilot
+```
 
 ```bash
 # five seeds of one configuration + aggregate table (mean, s.d., 95 % t-interval)
@@ -185,3 +195,7 @@ Each output directory also holds `figures_manifest.json` and draft `captions.md`
   a baseline, not as evidence about LLM behaviour.
 * Asset criticalities and gate thresholds in the configs are illustrative and must be
   set with plant operations.
+* Dataset labels are used as distributed. The 2019 WADI labels start about 3 s late and
+  place attack 13 twelve hours early (see `data/README.md`); TON_IoT network data is not
+  contiguous in time, mostly attacks, and has one time window per attack type, so its
+  chronological test split measures generalisation to unseen attack types.

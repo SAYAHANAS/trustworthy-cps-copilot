@@ -19,17 +19,38 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from cpscopilot.config import load_config
 
 __all__ = ["main"]
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
+def write_aggregate(run_dirs: list[Path], name: str) -> Path:
+    """Aggregate several runs of one configuration into a new directory."""
     from cpscopilot.pipeline.aggregate import aggregate_runs
-    from cpscopilot.pipeline.runner import ExperimentRunner
     from cpscopilot.utils.io import write_json_exclusive
     from cpscopilot.utils.run_manager import slugify, utc_stamp
+
+    summary, table = aggregate_runs(run_dirs)
+    base = Path(run_dirs[0]).parent / "aggregates" / f"{utc_stamp()}_{slugify(name)}"
+    base.parent.mkdir(parents=True, exist_ok=True)
+    out, n = base, 1
+    while True:  # never reuse a directory, even for two aggregates in the same second
+        try:
+            out.mkdir()
+            break
+        except FileExistsError:
+            n += 1
+            out = base.with_name(f"{base.name}-{n}")
+    write_json_exclusive(out / "summary.json", summary)
+    with (out / "metrics.csv").open("x", encoding="utf-8") as fh:
+        table.to_csv(fh, index=False)
+    return out
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    from cpscopilot.pipeline.runner import ExperimentRunner
 
     overrides = list(args.set or [])
     seeds = args.seeds or [None]
@@ -42,34 +63,43 @@ def _cmd_run(args: argparse.Namespace) -> int:
         run_dirs.append(result.run_dir)
         print(result.run_dir)
     if len(run_dirs) > 1:
-        summary, table = aggregate_runs(run_dirs)
-        out = run_dirs[0].parent / "aggregates" / f"{utc_stamp()}_{slugify(cfg.name)}"
-        out.mkdir(parents=True, exist_ok=False)
-        write_json_exclusive(out / "summary.json", summary)
-        with (out / "metrics.csv").open("x", encoding="utf-8") as fh:
-            table.to_csv(fh, index=False)
-        print(f"aggregate: {out}")
+        print(f"aggregate: {write_aggregate(run_dirs, cfg.name)}")
     return 0
 
 
-def _cmd_audit(args: argparse.Namespace) -> int:
-    """Data loading, splitting and leakage audit only (no training)."""
+def audit_report(cfg: Any) -> dict[str, Any]:
+    """Load the data, split it and return what ``cpscopilot audit`` prints."""
     from cpscopilot.data.features import CausalWindowFeaturizer
     from cpscopilot.data.labels import horizon_to_steps
     from cpscopilot.data.loaders import load_dataset
-    from cpscopilot.data.splitting import TemporalSplitter
+    from cpscopilot.data.splitting import SplitError, TemporalSplitter
     from cpscopilot.models.prediction import horizon_key
 
-    cfg = load_config(args.config, args.set)
     ds = load_dataset(cfg.dataset, cfg.resolve_path, cfg.seed)
     featurizer = CausalWindowFeaturizer(cfg.features)
     steps = {horizon_key(h): horizon_to_steps(h, ds.sampling_seconds)
              for h in cfg.labels.horizons_minutes}
     embargo = cfg.split.embargo_steps if cfg.split.embargo_steps is not None else max(
         featurizer.warmup_steps + 1, max(steps.values()))
-    split = TemporalSplitter(cfg.split, embargo).split(ds.frame)
-    report = {"dataset": ds.summary(), "horizon_steps": steps,
-              "split_audit": split.audit(ds.sampling_seconds)}
+    checks = {k: ds.fingerprint[k] for k in ("release_check", "read", "resampling",
+                                              "duplicate_timestamps", "attack_intervals",
+                                              "non_numeric_values_coerced")
+              if k in ds.fingerprint}
+    report: dict[str, Any] = {"dataset": ds.summary(), "data_checks": checks,
+                              "horizon_steps": steps,
+                              "data_files": [{"path": f["path"], "sha256": f["sha256"]}
+                                             for f in ds.fingerprint.get("files", [])]}
+    try:
+        report["split_audit"] = TemporalSplitter(cfg.split, embargo).split(ds.frame).audit(
+            ds.sampling_seconds)
+    except SplitError as exc:  # report the data checks together with the split problem
+        report["split_audit"] = {"passed": False, "error": str(exc)}
+    return report
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    """Data loading, splitting and leakage audit only (no training)."""
+    report = audit_report(load_config(args.config, args.set))
     print(json.dumps(report, indent=2, default=str))
     return 0 if report["split_audit"]["passed"] else 1
 

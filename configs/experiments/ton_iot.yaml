@@ -1,16 +1,22 @@
-# TON_IoT (UNSW Canberra) network dataset. Irregular flow records are shifted to the
-# time they become observable (connection end) and aggregated into right-closed 10 s
-# bins (sum/mean/max of numeric fields, event counts and distinct counts of
-# hosts/ports/services). Outages longer than max_gap_factor bins are dropped and start
-# a new segment. Use the full chronological network CSVs for
-# temporal experiments; the sampled train_test_network.csv is not contiguous in time.
+# TON_IoT (UNSW Canberra) network dataset: the full processed files
+# Processed_datasets/Processed_Network_dataset/Network_dataset_1.csv ... _23.csv
+# (22.3 M flow records, 3.4 GB). The Train_Test sample train_test_network.csv has no
+# time column and cannot be used here. Files are read in numeric order (2 before 10)
+# with only the columns below; flows are shifted to the time they become observable
+# (connection end) and aggregated into right-closed 10 s bins (sum/mean/max of
+# numeric fields, event counts and distinct counts of hosts/ports/services). Gaps
+# longer than max_gap_factor bins are outages: dropped, a new segment starts.
+# Data caveats for the paper: the capture is not contiguous (about 6.5 days of
+# traffic over 2-29 Apr 2019), about 96% of flows are attacks, and each attack type
+# occurs in one time window, so a chronological split tests unseen attack types.
+# Start with a few files to gauge memory (--set "dataset.paths=[...]").
 extends: ../default.yaml
 name: ton-iot-network
 description: TON_IoT network flows aggregated to 10 s windows.
 
 dataset:
   name: ton_iot
-  paths: [data/raw/TON_IoT/network/train_test_network.csv]
+  paths: [data/raw/TON_IoT/network/Network_dataset_*.csv]
   timestamp_col: ts
   timestamp_unit: s
   event_duration_col: duration   # bin each flow at ts + duration (when it is observable)

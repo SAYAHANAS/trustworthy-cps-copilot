@@ -1,6 +1,10 @@
-# SWaT (Secure Water Treatment, iTrust/SUTD), attack-period export (A1 Dec 2015).
-# Request access from iTrust and export SWaT_Dataset_Attack_v0 to CSV. The file is
-# only read (and SHA-256 fingerprinted); it is never modified.
+# SWaT (Secure Water Treatment, iTrust/SUTD), A1 & A2 Dec 2015 attack file.
+# The official SWaT_Dataset_Attack_v0.xlsx is read directly: it is converted once to
+# CSV under data/interim/excel_cache/ (keyed by its SHA-256, a few minutes the first
+# time) and never modified. A CSV export of it works too:
+#   --set "dataset.paths=[data/raw/SWaT/merged.csv]"
+# The loader warns if the rows differ from the official file (449,919 rows, 54,621
+# attack rows, 28/12/2015 10:00:00 AM to 2/1/2016 2:59:59 PM).
 #
 # The attack-period file is used for the supervised chronological split because
 # the normal-period file contains no attacks. Check `cpscopilot audit` first: every
@@ -12,7 +16,7 @@ description: SWaT attack period, 10 s causal bins, 5/15/30-minute horizons.
 
 dataset:
   name: swat
-  paths: [data/raw/SWaT/SWaT_Dataset_Attack_v0.csv]
+  paths: [data/raw/SWaT/SWaT_Dataset_Attack_v0.xlsx]
   timestamp_col: Timestamp
   label_col: Normal/Attack
   positive_labels: [Attack, A ttack]

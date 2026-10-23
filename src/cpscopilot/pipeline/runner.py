@@ -476,6 +476,7 @@ class ExperimentRunner:
             now = time.perf_counter()
             timings[name] = round(now - clock, 3)
             clock = now
+            log.info("stage '%s' done in %.1f s", name, timings[name])
 
         project_root = Path(cfg.project_root) if cfg.project_root else None
         ctx.save_yaml("config.resolved.yaml", cfg.model_dump(mode="json"))
@@ -506,6 +507,9 @@ class ExperimentRunner:
 
         # Stages 2-3 - detection and prediction
         n_jobs = cfg.runtime.n_jobs
+        log.info("training the detector and %d horizon models (%d + %d members) on %d rows x "
+                 "%d features", len(cfg.labels.horizons_minutes), cfg.detection.ensemble_size,
+                 cfg.prediction.ensemble_size, len(X["train"]), X["train"].shape[1])
         detector = DetectionModule(cfg.detection, cfg.seed, n_jobs).fit(
             X["train"], tr.y_now, "train", ledger, tr.row_ids)
         predictor = FutureThreatPredictor(cfg.labels.horizons_minutes, cfg.prediction, cfg.seed,

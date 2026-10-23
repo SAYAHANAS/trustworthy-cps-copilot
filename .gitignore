@@ -16,3 +16,6 @@ __pycache__/
 .coverage
 htmlcov/
 .venv/
+
+# Derived caches (e.g. Excel sheets converted to CSV), rebuilt from data/raw.
+data/interim/

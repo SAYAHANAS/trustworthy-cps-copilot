@@ -81,7 +81,10 @@ class DatasetConfig(_Strict):
     """Where and how to read the CPS telemetry."""
 
     name: Literal["synthetic", "swat", "wadi", "ton_iot", "generic_csv"] = "synthetic"
-    paths: list[str] = Field(default_factory=list)
+    paths: list[str] = Field(
+        default_factory=list,
+        description="Input files (CSV or Excel). Entries with * ? [ are glob patterns, matched "
+                    "files are sorted with numbers compared numerically (file_2 < file_10).")
     timestamp_col: str | None = None
     timestamp_cols: list[str] = Field(default_factory=list)
     timestamp_format: str | None = None
@@ -112,6 +115,15 @@ class DatasetConfig(_Strict):
                           "inherits the previous state. 'event': flow/log records, an empty bin "
                           "means no traffic and is an attack only between attack bins. None = "
                           "'event' when event_duration_col is set or for ton_iot, else 'polled'.")
+    row_time_origin: str | None = Field(
+        None, description="WADI 2019 (A2) exports store Time as mm:ss.0 without the hour, so "
+                          "timestamps are rebuilt as this origin + (Row - 1) s. None = the Date "
+                          "of Row 1 at 18:00:00 (the documented start of every WADI file); every "
+                          "row's date and mm:ss are checked against the rebuilt time.")
+    excel_cache_dir: str = Field(
+        "data/interim/excel_cache",
+        description="Excel sources (e.g. the official SWaT .xlsx) are converted once to CSV "
+                    "here, keyed by the source file's SHA-256; the raw file is never modified.")
     attack_intervals_path: str | None = None
     attack_intervals_format: str | None = Field(
         None, description="strptime format of the interval file; None = ISO 8601, else the "
@@ -411,12 +423,30 @@ def _deep_merge(base: dict[str, Any], child: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+class _ConfigLoader(yaml.SafeLoader):
+    """Safe YAML loader that keeps dates and times as text.
+
+    Config fields such as ``split.train_end`` are strings; PyYAML would otherwise
+    turn an unquoted ``2017-10-10 13:15:00`` into a datetime and validation fails.
+    """
+
+
+_ConfigLoader.yaml_implicit_resolvers = {
+    first: [(tag, regexp) for tag, regexp in resolvers if tag != "tag:yaml.org,2002:timestamp"]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+
+
+def _parse_yaml(text: Any) -> Any:
+    return yaml.load(text, Loader=_ConfigLoader)  # noqa: S506 - a SafeLoader subclass
+
+
 def _read_yaml_with_extends(path: Path, _seen: tuple[Path, ...] = ()) -> dict[str, Any]:
     path = path.resolve()
     if path in _seen:
         raise ValueError(f"circular 'extends' chain: {' -> '.join(map(str, (*_seen, path)))}")
     with path.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
+        data = _parse_yaml(fh) or {}
     if not isinstance(data, dict):
         raise ValueError(f"config {path} must be a mapping")
     parent = data.pop("extends", None)
@@ -433,7 +463,10 @@ def apply_overrides(data: dict[str, Any], overrides: list[str] | None) -> dict[s
         if "=" not in item:
             raise ValueError(f"override must look like key.path=value, got {item!r}")
         key, raw = item.split("=", 1)
-        value = yaml.safe_load(raw)
+        try:
+            value = _parse_yaml(raw)
+        except yaml.YAMLError:  # e.g. a strptime format such as %d/%m/%Y
+            value = raw
         node = out
         parts = key.strip().split(".")
         for part in parts[:-1]:
@@ -470,8 +503,19 @@ def load_config(
     return ExperimentConfig.model_validate(data)
 
 
+# Nested settings that do not change results (cache locations), and settings added
+# later that are left out while unset so that earlier configuration hashes stay valid.
+_NON_SCIENTIFIC_NESTED = {("dataset", "excel_cache_dir")}
+_OMIT_WHEN_NONE = {("dataset", "row_time_origin")}
+
+
 def _canonical(cfg: ExperimentConfig, exclude: set[str]) -> str:
     payload = {k: v for k, v in cfg.model_dump(mode="json").items() if k not in exclude}
+    for section, key in _NON_SCIENTIFIC_NESTED:
+        payload.get(section, {}).pop(key, None)
+    for section, key in _OMIT_WHEN_NONE:
+        if payload.get(section, {}).get(key, 0) is None:
+            payload[section].pop(key)
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 

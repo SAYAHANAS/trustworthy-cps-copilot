@@ -221,3 +221,68 @@ def test_onset_mode_keeps_ongoing_attacks_and_figures_need_no_baseline_method(
     out = generate_all([result.run_dir], tmp_path / "figs", formats=["pdf"], latex="off")
     assert (out / "fig_reliability_diagrams.pdf").exists()
     assert (out / "fig_horizon_performance.pdf").exists()
+
+
+def _load_study():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "run_study", Path(__file__).resolve().parents[1] / "scripts" / "run_study.py")
+    study = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(study)
+    return study
+
+
+def test_run_study_resumes_but_recomputes_when_inputs_change(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    study = _load_study()
+    frame, _ = generate_synthetic_cps(load_config(SMOKE, TINY_OVERRIDES).dataset.synthetic, 7)
+    frame = frame.drop(columns=["attack_type", "phase", "campaign_id"])
+    data = tmp_path / "plant.csv"
+    frame.to_csv(data, index=False)
+    config = tmp_path / "plant.yaml"
+    config.write_text(f"extends: {SMOKE.as_posix()}\nname: plant-csv\ndataset:\n"
+                      f"  name: generic_csv\n  paths: [{data.as_posix()}]\n"
+                      "  timestamp_col: timestamp\n  label_col: label\n")
+    sets = [*TINY_OVERRIDES, f"output_root={(tmp_path / 'runs').as_posix()}",
+            "copilot.enabled=false"]
+    args = ["--datasets", str(config), "--seeds", "0", "1", "--no-figures",
+            *[x for s in sets for x in ("--set", s)]]
+    runs = tmp_path / "runs"
+    assert study.main(args) == 0
+    out = capsys.readouterr().out
+    assert "split checks passed: True" in out and "aggregate:" in out
+    assert len(list(runs.glob("*/metrics.json"))) == 2
+    assert study.main(args) == 0  # an interrupted or repeated study reuses finished runs
+    out = capsys.readouterr().out
+    assert "seed 0: reusing" in out and "seed 1: reusing" in out
+    damaged = next(runs.glob("*_s1_*"))
+    (damaged / "manifest.json").chmod(0o644)
+    (damaged / "manifest.json").write_text("")  # e.g. power loss while it was written
+    assert study.main(args) == 0
+    out = capsys.readouterr().out
+    assert f"ignoring {damaged.name}" in out and "seed 0: reusing" in out
+    assert "seed 1: reusing" not in out and len(list(runs.glob("*/metrics.json"))) == 3
+    frame["label"] = frame["label"].shift(5, fill_value=0)  # the raw file is replaced
+    frame.to_csv(data, index=False)
+    assert study.main(args[:4] + args[5:]) == 0  # seed 0 only
+    out = capsys.readouterr().out
+    assert "reusing" not in out and len(list(runs.glob("*/metrics.json"))) == 4
+    missing = ["--datasets", "SWAT_typo", str(config), *args[2:]]
+    assert study.main(missing) == 1  # a failing dataset is reported, the others still run
+    out = capsys.readouterr().out
+    assert "unknown dataset 'SWAT_typo'" in out
+    assert "seed 0: reusing" in out and "seed 1: reusing" not in out  # seed 1 saw old data
+
+
+def test_run_study_requires_an_api_key_before_training(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("anthropic")
+    study = _load_study()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    cfg = load_config(SMOKE, ["copilot.llm.backend=anthropic"])
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY is not set"):
+        study._check_llm_credentials(cfg)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    study._check_llm_credentials(cfg)
+    study._check_llm_credentials(load_config(SMOKE))  # template backend: nothing to check
