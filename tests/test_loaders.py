@@ -450,7 +450,7 @@ def test_numeric_labels_match_whatever_their_text_form() -> None:
 
 
 def test_compare_script_confirms_a_faithful_copy_and_reports_differences(
-        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib.util
 
     openpyxl = pytest.importorskip("openpyxl")
@@ -471,7 +471,11 @@ def test_compare_script_confirms_a_faithful_copy_and_reports_differences(
     copy[" MV101"] = copy[" MV101"].astype(float)  # '2.0' instead of '2', as in merged.csv
     pd.concat([copy[copy["Normal/Attack"] == "Normal"], copy[copy["Normal/Attack"] != "Normal"]]
               ).to_csv(tmp_path / "merged.csv", index=False)  # normal rows first
-    config = str(Path(__file__).resolve().parents[1] / "configs/experiments/swat.yaml")
+    swat = (Path(__file__).resolve().parents[1] / "configs/experiments/swat.yaml").as_posix()
+    config = tmp_path / "swat.yaml"  # project root = tmp_path: the Excel cache goes there
+    config.write_text(f"extends: {swat}\n")
+    monkeypatch.chdir(tmp_path)
+    config = str(config)
     assert compare.main(["--config", config, str(tmp_path / "official.xlsx"),
                          str(tmp_path / "merged.csv")]) == 0
     assert "IDENTICAL: 40 rows" in capsys.readouterr().out
