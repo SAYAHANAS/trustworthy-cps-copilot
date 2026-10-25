@@ -1,0 +1,157 @@
+# Baseline configuration. Experiment configs inherit with `extends: ../default.yaml`
+# and override only what differs. Every key is validated (unknown keys fail).
+# Relative paths resolve against the project root (the directory with pyproject.toml).
+
+name: default
+description: Baseline settings shared by all experiments.
+seed: 42
+output_root: runs
+
+dataset:
+  name: synthetic
+  max_gap_factor: 5.0          # timestamp gap (x sampling period) that starts a new segment;
+                               # with resampling, longer runs of empty bins are dropped
+  event_duration_col: null     # flow logs: bin each record at ts + this duration (seconds)
+  record_kind: null            # polled | event: how kept empty bins are labelled
+                               # (null: event with event_duration_col or ton_iot, else polled)
+  attack_intervals_format: null  # strptime format of an attack-interval file
+                                 # (null: ISO 8601, else the dataset's dayfirst)
+  synthetic:
+    days: 4.0
+    sampling_seconds: 10
+    n_attacks: 32
+    attack_duration_minutes: [5.0, 25.0]
+    precursor_lead_minutes: [8.0, 35.0]
+    precursor_probability: 0.8
+    false_precursor_rate_per_day: 4.0
+    missing_rate: 0.001
+    drift_strength: 0.5          # slow sensor drift -> mild distribution shift in later splits
+
+split:
+  strategy: fraction           # chronological: train -> calibration -> test
+  train_frac: 0.6
+  calibration_frac: 0.2
+  test_frac: 0.2
+  embargo_steps: null          # null = max(feature warm-up + 1, longest horizon)
+  min_positive_rows: 1
+
+features:                      # trailing (causal) windows, in rows
+  windows: [6, 30]             # 1 min and 5 min at 10 s sampling
+  stats: [mean, std, min, max]
+  include_raw: true
+  diff_lags: [1]
+  ffill_limit: null
+  min_train_coverage: 0.5      # drop columns with less non-missing data in the train split
+
+labels:
+  horizons_minutes: [5, 15, 30]
+  future_mode: any             # any = attack active within (t, t+h]; onset = attack starts
+
+detection:
+  backend: xgboost
+  ensemble_size: 5
+  bootstrap: none
+  class_weight: balanced
+  params: {n_estimators: 300, max_depth: 6, learning_rate: 0.05, subsample: 0.8,
+           colsample_bytree: 0.8, min_child_weight: 1.0, reg_lambda: 1.0}
+
+prediction:
+  backend: xgboost
+  ensemble_size: 5
+  bootstrap: none
+  class_weight: balanced
+  params: {n_estimators: 300, max_depth: 6, learning_rate: 0.05, subsample: 0.8,
+           colsample_bytree: 0.8, min_child_weight: 1.0, reg_lambda: 1.0}
+
+calibration:
+  method: temperature
+  compare_methods: [none, temperature, platt, isotonic]
+  n_bins: 15
+
+trust:
+  anomaly_tail_quantile: 0.95
+  anomaly_z_threshold: 3.0
+  top_k_features: 5
+  default_horizon_decay: 0.01  # risk weight exp(-0.01 * minutes) per horizon
+  consistency_weights: {cross_source: 0.7, temporal_coherence: 0.3}
+  epistemic_reference_quantile: 0.99
+  suspicious_recall_target: 0.95
+  default_criticality: 0.5
+  # Illustrative criticality values; set them with plant operations.
+  asset_rules:
+    - {pattern: "^[A-Z]+_?1\\d\\d", asset: P1_raw_water, criticality: 0.6,
+       description: "Stage P1 raw water intake tank, inlet valve and transfer pump"}
+    - {pattern: "^[A-Z]+_?2\\d\\d", asset: P2_chemical_dosing, criticality: 0.9,
+       description: "Stage P2 chemical dosing analyzers and dosing pumps (water quality, safety)"}
+    - {pattern: "^[A-Z]+_?3\\d\\d", asset: P3_ultrafiltration, criticality: 0.7,
+       description: "Stage P3 ultrafiltration tank, membranes and pumps"}
+    - {pattern: "^[A-Z]+_?4\\d\\d", asset: P4_dechlorination, criticality: 0.75,
+       description: "Stage P4 dechlorination"}
+    - {pattern: "^[A-Z]+_?5\\d\\d", asset: P5_reverse_osmosis, criticality: 0.8,
+       description: "Stage P5 reverse osmosis membranes and high-pressure pumps"}
+    - {pattern: "^[A-Z]+_?6\\d\\d", asset: P6_backwash, criticality: 0.5,
+       description: "Stage P6 backwash"}
+    - {pattern: "^NET_", asset: control_network, criticality: 0.8,
+       description: "Control network connecting controllers, HMI, historian and engineering workstations"}
+    - {pattern: "^AMB_", asset: environment, criticality: 0.2,
+       description: "Ambient environmental sensors"}
+
+gate:
+  abstain_epistemic_quantile: 0.99   # data-driven on the calibration split
+  abstain_max_epistemic: null        # set a number to override the quantile
+  abstain_min_consistency: 0.35
+  approval_min_risk: 0.6
+  approval_min_criticality: 0.85
+  recommend_min_risk: 0.3
+  recommend_min_confidence: 0.6
+  explain_min_risk: 0.1              # floors; raised to meet the alert budgets below
+  explain_benign_budget: 0.10        # <= 10% of benign calibration rows reach Explain+
+  recommend_benign_budget: 0.02      # <= 2% of benign calibration rows reach Recommend+
+  junior_requires_approval: true
+  junior_explain_factor: 0.75
+  senior_confidence_offset: -0.05
+  high_workload_threshold: 0.8
+  high_workload_explain_factor: 1.5
+  night_approval_factor: 0.9
+  override_rate_threshold: 0.3
+  override_confidence_offset: 0.1
+  analyst_profiles:                  # the first profile drives the copilot run
+    - {analyst_id: baseline, expertise: intermediate, workload: 0.5, shift: day}
+    - {analyst_id: junior_day, expertise: junior, workload: 0.4, shift: day}
+    - {analyst_id: senior_overloaded, expertise: senior, workload: 0.9, shift: day}
+    - {analyst_id: night_shift, expertise: intermediate, workload: 0.6, shift: night}
+
+copilot:
+  enabled: true
+  knowledge_base_dir: knowledge_base
+  top_k: 4
+  chunk_words: 140
+  chunk_overlap_words: 30
+  max_events: 60
+  max_steps: 5
+  support_threshold: 0.5
+  feature_glossary: {}               # empty = built-in glossary
+  llm:
+    backend: template                # template (offline, deterministic) | anthropic
+    model: claude-opus-5-5
+    max_tokens: 8000
+    effort: medium
+    use_refusal_fallback: true
+    timeout_seconds: 120
+    max_retries: 2
+    cache_dir: llm_cache             # append-only response cache for reproducibility
+    fault_injection: {}              # e.g. {fabricated_citation: 0.3, invented_entity: 0.3}
+
+evaluation:
+  n_bins: 15
+  bootstrap_resamples: 500
+  bootstrap_block_size: null         # null = max(10, ceil(n^(1/3)))
+  confidence_level: 0.95
+  curve_points: 400
+
+runtime:
+  n_jobs: 4
+  strict_leakage_checks: true
+  leakage_probes: 12
+  log_level: INFO
+  save_models: false

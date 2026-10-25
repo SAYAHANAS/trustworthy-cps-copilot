@@ -1,0 +1,41 @@
+# SWaT (Secure Water Treatment, iTrust/SUTD), A1 & A2 Dec 2015 attack file.
+# The official SWaT_Dataset_Attack_v0.xlsx is read directly: it is converted once to
+# CSV under data/interim/excel_cache/ (keyed by its SHA-256, a few minutes the first
+# time) and never modified. A CSV export of it works too:
+#   --set "dataset.paths=[data/raw/SWaT/merged.csv]"
+# The loader warns if the rows differ from the official file (449,919 rows, 54,621
+# attack rows, 28/12/2015 10:00:00 AM to 2/1/2016 2:59:59 PM).
+#
+# The attack-period file is used for the supervised chronological split because
+# the normal-period file contains no attacks. Check `cpscopilot audit` first: every
+# split must contain attacks (min_positive_rows) - adjust fractions or switch to
+# strategy: timestamp with explicit train_end / calibration_end if needed.
+extends: ../default.yaml
+name: swat
+description: SWaT attack period, 10 s causal bins, 5/15/30-minute horizons.
+
+dataset:
+  name: swat
+  paths: [data/raw/SWaT/SWaT_Dataset_Attack_v0.xlsx]
+  timestamp_col: Timestamp
+  label_col: Normal/Attack
+  positive_labels: [Attack, A ttack]
+  dayfirst: true
+  resample_seconds: 10
+  resample_aggs: [mean]
+
+split:
+  strategy: fraction
+  train_frac: 0.6
+  calibration_frac: 0.2
+  test_frac: 0.2
+  min_positive_rows: 30
+
+features:
+  windows: [6, 30, 90]
+  stats: [mean, std, min, max, slope]
+
+trust:
+  # SWaT tags carry the stage in their first digit (FIT101 -> P1, AIT202 -> P2, ...);
+  # the default asset_rules already encode stages P1-P6.
+  default_criticality: 0.5

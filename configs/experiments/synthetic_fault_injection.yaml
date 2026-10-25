@@ -1,0 +1,14 @@
+# Audit-sensitivity experiment: corrupt copilot outputs on purpose and measure how
+# many faults the hallucination audit detects and the guardrails remove.
+extends: synthetic_smoke.yaml
+name: synthetic-fault-injection
+description: Seeded fabricated citations, numbers, entities and policy violations.
+
+copilot:
+  max_events: 40
+  llm:
+    fault_injection:
+      fabricated_citation: 0.3
+      numeric_perturbation: 0.3
+      invented_entity: 0.3
+      policy_violation: 0.3

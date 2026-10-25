@@ -1,0 +1,44 @@
+# WADI (Water Distribution, iTrust/SUTD), attack period 9-11 Oct 2017.
+# Default: the 2019 release file WADI_attackdataLABLE.csv (labels included). Its Time
+# column has no hour (Excel 'mm:ss.0' rendering in the official file), so timestamps
+# are rebuilt from the Row column as 2017-10-09 18:00:00 + (Row - 1) s and checked
+# against every row's date and mm:ss. The 2017 release file WADI_attackdata.csv
+# ('h:mm:ss.000 PM' times, no labels) works too, with an attack-interval file:
+#   attack_intervals_path: data/raw/WADI/attack_intervals.csv   (columns: start,end[,attack_type])
+# Setting attack_intervals_path also replaces the 2019 built-in labels by the
+# intervals (those labels start about 3 s late and put attack 13 at 00:07 instead of
+# 12:07 on 11 Oct 2017). Preamble lines are detected automatically.
+extends: ../default.yaml
+name: wadi
+description: WADI attack period, 10 s causal bins, 5/15/30-minute horizons.
+
+dataset:
+  name: wadi
+  paths: [data/raw/WADI/WADI_attackdataLABLE.csv]
+  resample_seconds: 10
+  resample_aggs: [mean]
+
+split:
+  # The 15 attacks fall on 9 Oct evening, 10 Oct 10:24-17:49 and 11 Oct 10:55-15:37, so a
+  # 60/20/20 fraction split leaves almost no attack in calibration. These boundaries put
+  # attacks 1-5 in train, 6-8 in calibration and 9-15 in test; each 30-minute embargo
+  # (window + horizon) lies outside any attack. With the built-in 2019 labels, attack 13
+  # is labelled at 00:07 on 11 Oct and so falls in calibration (see attack_intervals_path).
+  strategy: timestamp
+  train_end: "2017-10-10 13:00:00"
+  calibration_end: "2017-10-11 06:00:00"
+  min_positive_rows: 30
+
+features:
+  windows: [6, 30, 90]
+  stats: [mean, std, min, max]
+
+trust:
+  # WADI tags look like 1_AIT_001_PV, 2_FIT_001_PV ...: first digit = process stage.
+  asset_rules:
+    - {pattern: "^1_", asset: W1_supply, criticality: 0.7,
+       description: "Stage 1 raw water supply and storage"}
+    - {pattern: "^2A?_|^2B_", asset: W2_distribution, criticality: 0.9,
+       description: "Stage 2 elevated reservoir and consumer distribution network"}
+    - {pattern: "^3_", asset: W3_return, criticality: 0.6,
+       description: "Stage 3 return water"}
